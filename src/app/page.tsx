@@ -1,5 +1,5 @@
-import AppShell from '@/components/AppShell';
+import CodegenAppShell from '@/components/CodegenAppShell';
 
 export default function HomePage() {
-  return <AppShell />;
+  return <CodegenAppShell />;
 }

@@ -42,7 +42,7 @@ function envInt(name: string, fallback: number, min = 1): number {
 
 const DEFAULT_SMOKE_TICKS = envInt('SMOKE_SIM_TICKS', 600, 60);
 const MAX_REPAIR_ATTEMPTS = envInt('MAX_REPAIR_ATTEMPTS', 1, 1);
-const MODEL_CALL_TIMEOUT_MS = envInt('MODEL_CALL_TIMEOUT_MS', 60000, 1000);
+const MODEL_CALL_TIMEOUT_MS = envInt('MODEL_CALL_TIMEOUT_MS', 120000, 1000);
 
 function nowMs(): number {
   return Date.now();

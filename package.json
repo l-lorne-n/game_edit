@@ -9,6 +9,8 @@
     "start": "next start",
     "lint": "eslint . --max-warnings=0",
     "test:critical": "vitest run tests/critical --coverage=false",
+    "test:projects": "vitest run tests/projects --coverage=false",
+    "test:sandbox": "vitest run tests/sandbox --coverage=false",
     "smoke:sim": "tsx scripts/smoke-sim.ts --fixture basic-dodge"
   },
   "keywords": [],

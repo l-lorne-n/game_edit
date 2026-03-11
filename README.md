@@ -234,7 +234,7 @@ Copy `.env.example` to `.env.local` (or `.env`) and fill in the required values.
 
 - `MAX_REPAIR_ATTEMPTS=1`
 - `SMOKE_SIM_TICKS=600`
-- `MODEL_CALL_TIMEOUT_MS=60000`
+- `MODEL_CALL_TIMEOUT_MS=120000`
 
 ## Local Development
 
