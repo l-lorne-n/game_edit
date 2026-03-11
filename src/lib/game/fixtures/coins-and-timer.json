@@ -1,0 +1,90 @@
+{
+  "version": "1.0",
+  "meta": {
+    "title": "Coin Sprint Survival",
+    "description": "Dodge enemies, collect coins, and reach score target before time runs out."
+  },
+  "arena": {
+    "width": 960,
+    "height": 540,
+    "backgroundColor": "#1b1b3a"
+  },
+  "player": {
+    "radius": 13,
+    "color": "#7ee081",
+    "speed": 300,
+    "start": { "x": 480, "y": 270 },
+    "maxInvulnerabilityMs": 700
+  },
+  "enemies": [
+    {
+      "id": "slow-orb",
+      "radius": 10,
+      "color": "#ff4d6d",
+      "speed": 95,
+      "spawn": { "x": 50, "y": 50 },
+      "damage": 1,
+      "behavior": "seek"
+    }
+  ],
+  "spawners": [
+    {
+      "id": "orb-spawn",
+      "intervalMs": 1800,
+      "maxAlive": 8,
+      "templateEnemyId": "slow-orb",
+      "area": {
+        "xMin": 0,
+        "xMax": 960,
+        "yMin": 0,
+        "yMax": 540
+      }
+    }
+  ],
+  "collectibles": [
+    {
+      "id": "coin-a",
+      "kind": "coin",
+      "radius": 8,
+      "color": "#ffca3a",
+      "value": 5,
+      "spawn": { "x": 160, "y": 110 }
+    },
+    {
+      "id": "coin-b",
+      "kind": "coin",
+      "radius": 8,
+      "color": "#ffca3a",
+      "value": 5,
+      "spawn": { "x": 810, "y": 260 }
+    },
+    {
+      "id": "coin-c",
+      "kind": "coin",
+      "radius": 8,
+      "color": "#ffca3a",
+      "value": 5,
+      "spawn": { "x": 430, "y": 420 }
+    }
+  ],
+  "rules": {
+    "durationSec": 60,
+    "startingLives": 3,
+    "winCondition": {
+      "type": "scoreAtLeast",
+      "scoreTarget": 15
+    },
+    "loseCondition": {
+      "type": "livesDepleted"
+    }
+  },
+  "ui": {
+    "showTimer": true,
+    "showScore": true,
+    "showLives": true
+  },
+  "theme": {
+    "name": "Arcade",
+    "accentColor": "#ffca3a"
+  }
+}

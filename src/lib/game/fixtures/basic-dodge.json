@@ -1,0 +1,81 @@
+{
+  "version": "1.0",
+  "meta": {
+    "title": "Neon Dodge",
+    "description": "Survive incoming seekers for 45 seconds."
+  },
+  "arena": {
+    "width": 960,
+    "height": 540,
+    "backgroundColor": "#101820"
+  },
+  "player": {
+    "radius": 14,
+    "color": "#7bdff2",
+    "speed": 280,
+    "start": { "x": 480, "y": 270 },
+    "maxInvulnerabilityMs": 800
+  },
+  "enemies": [
+    {
+      "id": "chaser-basic",
+      "radius": 12,
+      "color": "#ff5d73",
+      "speed": 120,
+      "spawn": { "x": 100, "y": 100 },
+      "damage": 1,
+      "behavior": "seek"
+    }
+  ],
+  "spawners": [
+    {
+      "id": "main-spawner",
+      "intervalMs": 1500,
+      "maxAlive": 10,
+      "templateEnemyId": "chaser-basic",
+      "area": {
+        "xMin": 0,
+        "xMax": 960,
+        "yMin": 0,
+        "yMax": 540
+      }
+    }
+  ],
+  "collectibles": [
+    {
+      "id": "coin-1",
+      "kind": "coin",
+      "radius": 8,
+      "color": "#f4d35e",
+      "value": 10,
+      "spawn": { "x": 200, "y": 150 }
+    },
+    {
+      "id": "coin-2",
+      "kind": "coin",
+      "radius": 8,
+      "color": "#f4d35e",
+      "value": 10,
+      "spawn": { "x": 750, "y": 380 }
+    }
+  ],
+  "rules": {
+    "durationSec": 45,
+    "startingLives": 3,
+    "winCondition": {
+      "type": "survive"
+    },
+    "loseCondition": {
+      "type": "livesDepleted"
+    }
+  },
+  "ui": {
+    "showTimer": true,
+    "showScore": true,
+    "showLives": true
+  },
+  "theme": {
+    "name": "Neon",
+    "accentColor": "#00a6fb"
+  }
+}

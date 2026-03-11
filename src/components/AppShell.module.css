@@ -1,0 +1,85 @@
+.main {
+  padding: 20px;
+  max-width: 1500px;
+  margin: 0 auto;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: minmax(280px, 1fr) minmax(220px, 0.8fr) minmax(420px, 1.6fr);
+  gap: 12px;
+}
+
+.previewPanel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px;
+  min-height: 520px;
+  display: flex;
+  flex-direction: column;
+}
+
+.previewBody {
+  flex: 1;
+  min-height: 0;
+}
+
+.previewHeaderRow {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.previewControls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ctrlBtn {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  padding: 6px 10px;
+  cursor: pointer;
+}
+
+.ctrlBtnPrimary {
+  border: none;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #04111f;
+  font-weight: 700;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+
+.archiveSelect {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--text);
+  padding: 6px 10px;
+  max-width: 260px;
+}
+
+.ctrlBtn:disabled,
+.ctrlBtnPrimary:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+@media (max-width: 1200px) {
+  .grid {
+    grid-template-columns: 1fr;
+  }
+
+  .previewPanel {
+    min-height: 420px;
+  }
+}

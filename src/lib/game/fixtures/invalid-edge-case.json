@@ -1,0 +1,41 @@
+{
+  "version": "1.0",
+  "meta": {
+    "title": "Broken",
+    "description": "Invalid fixture for validation tests."
+  },
+  "arena": {
+    "width": 200,
+    "height": 120,
+    "backgroundColor": "#GGGGGG"
+  },
+  "player": {
+    "radius": 60,
+    "color": "#ffffff",
+    "speed": -10,
+    "start": { "x": -10, "y": -10 },
+    "maxInvulnerabilityMs": 5000
+  },
+  "enemies": [],
+  "spawners": [],
+  "collectibles": [],
+  "rules": {
+    "durationSec": 5,
+    "startingLives": 0,
+    "winCondition": {
+      "type": "scoreAtLeast"
+    },
+    "loseCondition": {
+      "type": "livesDepleted"
+    }
+  },
+  "ui": {
+    "showTimer": true,
+    "showScore": true,
+    "showLives": true
+  },
+  "theme": {
+    "name": "Invalid",
+    "accentColor": "#00FF00"
+  }
+}
