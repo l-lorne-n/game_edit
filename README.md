@@ -13,6 +13,13 @@
 
 6：打开本地3000端口即可
 
+视频介绍已经上传百度网盘:
+
+通过网盘分享的文件：agentland实习作业
+链接: https://pan.baidu.com/s/1-ap8mnpEiVbk-jEGx8xr7A?pwd=rain 提取码: rain 
+--来自百度网盘超级会员v6的分享
+
+
 项目说明
 
 这是一个分两阶段演进的 AI 原生 2D 游戏编辑器项目。
