@@ -2,10 +2,15 @@
 
 使用方法：
 1：git clone 到本地文件夹
+
 2：cd game_edit
+
 3：找到 .env.example文件,将其重命名为.env,该项目默认使用中转站apipyi的apikey,将key粘贴到APIYI_LLM_API_KEY的后面,同时保留了openrouter的接口(但是该通道测试不足,无法保证一定好用),如果想要切换到open router,请先将#LLM_PROVIDER=apiyi这行取消注释,并将apiyi更换为openrouter,同时将其对应的key填到OPENROUTER_LLM_API_KEY后面.
+
 4：npm install 
+
 5：npm run dev
+
 6：打开本地3000端口即可
 
 项目说明
