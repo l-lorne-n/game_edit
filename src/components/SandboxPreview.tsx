@@ -129,7 +129,7 @@ function buildSandboxDoc(pkg: GeneratedGamePackage): string {
 
 export default function SandboxPreview({
   packageData,
-  timeoutMs = 8000,
+  timeoutMs = 50000,
   onReport,
   runtimeNonce = 0,
 }: Props) {
@@ -229,7 +229,7 @@ export default function SandboxPreview({
                 errors: ['runTests timeout'],
               }),
             );
-          }, 5000);
+          }, timeoutMs);
         }
         return;
       }

@@ -2,6 +2,9 @@ import { NextResponse } from 'next/server';
 
 import { modifyPackageFromInstruction } from '@/lib/ai/generate-package';
 import { parseGeneratedGamePackage } from '@/lib/package/contracts';
+import { createProjectService } from '@/lib/projects/service';
+
+const projectService = createProjectService();
 
 export async function POST(request: Request) {
   try {
@@ -10,6 +13,7 @@ export async function POST(request: Request) {
       currentPackage?: unknown;
       lastKnownGoodPackage?: unknown;
       targetId?: string;
+      projectId?: string;
     };
 
     const instruction = body.instruction?.trim();
@@ -39,6 +43,22 @@ export async function POST(request: Request) {
       lastKnownGood: parsedLastGood?.ok ? parsedLastGood.pkg : undefined,
     });
 
+    let persistedProject = null;
+    let persistenceWarning: string | null = null;
+    if (body.projectId) {
+      try {
+        persistedProject = await projectService.saveGeneratedPackage({
+          projectId: body.projectId,
+          pkg: result.pkg,
+          source: 'modify',
+          parentVersion: (await projectService.getProject(body.projectId))?.currentVersion ?? null,
+          evaluator: result.staticEvaluation,
+        });
+      } catch (error) {
+        persistenceWarning = error instanceof Error ? error.message : 'Project persistence is unavailable.';
+      }
+    }
+
     return NextResponse.json({
       ok: true,
       instruction,
@@ -53,6 +73,8 @@ export async function POST(request: Request) {
       provider: result.provider,
       model: result.model,
       attempts: result.attempts,
+      project: persistedProject,
+      persistenceWarning,
     });
   } catch (error) {
     return NextResponse.json(

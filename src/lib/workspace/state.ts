@@ -70,6 +70,7 @@ export function createProject(input?: { name?: string; mode?: ActionMode }): Gam
     name: input?.name?.trim() || 'New Game Project',
     createdAt,
     updatedAt: createdAt,
+    persistenceMode: 'local',
     messages: [
       makeChatMessage({
         role: 'system',

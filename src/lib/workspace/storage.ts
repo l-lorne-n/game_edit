@@ -1,11 +1,20 @@
+import { createProject as createServerProject, listProjects, saveProjectPackage } from '@/lib/projects/client';
+import { snapshotIdFromVersion } from '@/lib/projects/package-files';
+import type { HydratedProjectRecord } from '@/lib/projects/types';
 import { createTemplatePackage } from '@/lib/package/template';
 import {
-  appendMessages,
   createDefaultWorkspace,
   createProject,
   CURRENT_WORKSPACE_VERSION,
+  DEFAULT_WORKSPACE_LIMITS,
+  makeChatMessage,
 } from '@/lib/workspace/state';
-import type { GameProject, WorkspaceState } from '@/lib/workspace/types';
+import type {
+  GameProject,
+  ProjectSnapshot,
+  SnapshotStatus,
+  WorkspaceState,
+} from '@/lib/workspace/types';
 
 const DB_NAME = 'game-edit-workspace-db';
 const STORE_NAME = 'workspace';
@@ -84,10 +93,145 @@ function normalizeWorkspace(input: unknown): WorkspaceState | null {
     limits:
       candidate.limits && typeof candidate.limits === 'object'
         ? (candidate.limits as WorkspaceState['limits'])
-        : {
-            maxProjects: 25,
-            maxSnapshotsPerProject: 20,
-          },
+        : DEFAULT_WORKSPACE_LIMITS,
+  };
+}
+
+function parseManifestTitle(manifestJson: string, fallback: string): string {
+  try {
+    const parsed = JSON.parse(manifestJson) as { title?: unknown };
+    if (typeof parsed.title === 'string' && parsed.title.trim()) {
+      return parsed.title.trim();
+    }
+  } catch {
+    return fallback;
+  }
+
+  return fallback;
+}
+
+function inferStatusFromEvaluator(evaluator: GameProject['currentEvaluator'] | null): SnapshotStatus {
+  if (!evaluator) {
+    return 'unknown';
+  }
+  return evaluator.ok ? 'passed' : 'failed';
+}
+
+function toSnapshot(project: HydratedProjectRecord, version: HydratedProjectRecord['versions'][number], cachedProject?: GameProject): ProjectSnapshot {
+  const snapshotId = snapshotIdFromVersion(version.version);
+  const cachedSnapshot = cachedProject?.snapshots.find(item => item.id === snapshotId) ?? null;
+
+  return {
+    id: snapshotId,
+    title: parseManifestTitle(version.pkg.manifestJson, `Version ${version.version}`),
+    createdAt: version.createdAt,
+    parentSnapshotId: version.parentVersion ? snapshotIdFromVersion(version.parentVersion) : null,
+    status: version.status,
+    pkg: version.pkg,
+    evaluator: version.evaluator,
+  };
+}
+
+export function toGameProject(project: HydratedProjectRecord, cachedProject?: GameProject): GameProject {
+  const snapshots = project.versions.map(version => toSnapshot(project, version, cachedProject));
+  const currentSnapshotId = project.currentVersion > 0 ? snapshotIdFromVersion(project.currentVersion) : '';
+  const currentVersion = project.versions.find(version => version.version === project.currentVersion) ?? null;
+  const defaultSystemMessage = makeChatMessage({
+    role: 'system',
+    mode: 'system',
+    text: `Server-backed project ready. Current head version: ${project.currentVersion}.`,
+  });
+
+  return {
+    id: project.id,
+    name: project.name,
+    createdAt: project.createdAt,
+    updatedAt: project.updatedAt,
+    persistenceMode: 'server',
+    messages: cachedProject?.messages?.length ? cachedProject.messages : [defaultSystemMessage],
+    currentPackage: currentVersion?.pkg ?? null,
+    currentEvaluator: currentVersion?.evaluator ?? cachedProject?.currentEvaluator ?? null,
+    snapshots,
+    selectedSnapshotId:
+      cachedProject?.selectedSnapshotId && snapshots.some(snapshot => snapshot.id === cachedProject.selectedSnapshotId)
+        ? cachedProject.selectedSnapshotId
+        : currentSnapshotId,
+    selectedModifyBaseId:
+      cachedProject?.selectedModifyBaseId &&
+      (cachedProject.selectedModifyBaseId === '__current__' ||
+        snapshots.some(snapshot => snapshot.id === cachedProject.selectedModifyBaseId))
+        ? cachedProject.selectedModifyBaseId
+        : currentSnapshotId || '__current__',
+    selectedDebugTargetId:
+      cachedProject?.selectedDebugTargetId &&
+      (cachedProject.selectedDebugTargetId === '__current__' ||
+        snapshots.some(snapshot => snapshot.id === cachedProject.selectedDebugTargetId))
+        ? cachedProject.selectedDebugTargetId
+        : currentSnapshotId || '__current__',
+    lastMode: cachedProject?.lastMode ?? 'create',
+    attempts: cachedProject?.attempts ?? [],
+    lastGreenSnapshotId:
+      cachedProject?.lastGreenSnapshotId && snapshots.some(snapshot => snapshot.id === cachedProject.lastGreenSnapshotId)
+        ? cachedProject.lastGreenSnapshotId
+        : snapshots.find(snapshot => snapshot.status === 'passed')?.id ?? null,
+    lastRouteDecision: cachedProject?.lastRouteDecision ?? null,
+    lastExecutionTrace: cachedProject?.lastExecutionTrace ?? null,
+  };
+}
+
+export function mergeServerProjects(serverProjects: HydratedProjectRecord[], cachedWorkspace: WorkspaceState | null): WorkspaceState {
+  const cachedByProjectId = new Map((cachedWorkspace?.projects ?? []).map(project => [project.id, project]));
+  const projects = serverProjects.map(project => toGameProject(project, cachedByProjectId.get(project.id)));
+
+  return {
+    version: CURRENT_WORKSPACE_VERSION,
+    activeProjectId:
+      cachedWorkspace?.activeProjectId && projects.some(project => project.id === cachedWorkspace.activeProjectId)
+        ? cachedWorkspace.activeProjectId
+        : projects[0]?.id ?? '',
+    projects,
+    limits: cachedWorkspace?.limits ?? DEFAULT_WORKSPACE_LIMITS,
+  };
+}
+
+export function mergeServerProjectIntoWorkspace(
+  workspace: WorkspaceState,
+  serverProject: HydratedProjectRecord,
+): WorkspaceState {
+  const cachedProject = workspace.projects.find(project => project.id === serverProject.id);
+  const nextProject = toGameProject(serverProject, cachedProject);
+  const currentHeadSnapshotId = serverProject.currentVersion > 0 ? snapshotIdFromVersion(serverProject.currentVersion) : '';
+  const cachedHeadVersion = cachedProject
+    ? Math.max(...cachedProject.snapshots.map(snapshot => Number.parseInt(snapshot.id.replace(/^v/, ''), 10)).filter(Number.isFinite), 0)
+    : 0;
+  const shouldSelectNewHead = serverProject.currentVersion > cachedHeadVersion;
+  const normalizedProject = shouldSelectNewHead
+    ? {
+        ...nextProject,
+        selectedSnapshotId: currentHeadSnapshotId,
+        selectedModifyBaseId: currentHeadSnapshotId || '__current__',
+        selectedDebugTargetId: currentHeadSnapshotId || '__current__',
+      }
+    : nextProject;
+  const existingIndex = workspace.projects.findIndex(project => project.id === serverProject.id);
+
+  if (existingIndex === -1) {
+    return {
+      ...workspace,
+      activeProjectId: serverProject.id,
+      projects: [...workspace.projects, normalizedProject],
+    };
+  }
+
+  const projects = [...workspace.projects];
+  projects[existingIndex] = normalizedProject;
+  return {
+    ...workspace,
+    projects,
+    activeProjectId:
+      workspace.activeProjectId && workspace.projects.some(project => project.id === workspace.activeProjectId)
+        ? workspace.activeProjectId
+        : serverProject.id,
   };
 }
 
@@ -155,30 +299,29 @@ function migrateLegacyArchives(): WorkspaceState | null {
       };
     });
 
-  const messages = snapshots.flatMap(snapshot => [
-    {
-      id: `legacy-msg-${snapshot.id}`,
-      role: 'system' as const,
-      mode: 'system' as const,
-      text: `Imported legacy archive "${snapshot.title}". Legacy DSL payload:\n${snapshot.legacyDsl}`,
-      createdAt: snapshot.createdAt,
-    },
-  ]);
+  const messages = snapshots.map(snapshot => ({
+    id: `legacy-msg-${snapshot.id}`,
+    role: 'system' as const,
+    mode: 'system' as const,
+    text: `Imported legacy archive "${snapshot.title}". Legacy DSL payload:\n${snapshot.legacyDsl}`,
+    createdAt: snapshot.createdAt,
+  }));
 
   const cleanSnapshots = snapshots.map(({ legacyDsl: _legacyDsl, ...snapshot }) => snapshot);
 
-  const importedProject: GameProject = {
-    ...appendMessages(project, messages),
-    snapshots: cleanSnapshots,
-    selectedSnapshotId: cleanSnapshots[0]?.id ?? '',
-    selectedModifyBaseId: cleanSnapshots[0]?.id ?? '__current__',
-    selectedDebugTargetId: cleanSnapshots[0]?.id ?? '__current__',
-  };
-
   return {
     ...createDefaultWorkspace('Imported Legacy Project'),
-    activeProjectId: importedProject.id,
-    projects: [importedProject],
+    activeProjectId: project.id,
+    projects: [
+      {
+        ...project,
+        messages,
+        snapshots: cleanSnapshots,
+        selectedSnapshotId: cleanSnapshots[0]?.id ?? '',
+        selectedModifyBaseId: cleanSnapshots[0]?.id ?? '__current__',
+        selectedDebugTargetId: cleanSnapshots[0]?.id ?? '__current__',
+      },
+    ],
   };
 }
 
@@ -226,6 +369,7 @@ function loadFromLocalFallback(): WorkspaceState | null {
   if (!raw) {
     return null;
   }
+
   try {
     return normalizeWorkspace(JSON.parse(raw));
   } catch {
@@ -237,26 +381,97 @@ function saveToLocalFallback(workspace: WorkspaceState): void {
   if (!hasWindow()) {
     return;
   }
+
   window.localStorage.setItem(FALLBACK_LOCAL_KEY, JSON.stringify(workspace));
+}
+
+async function importCachedWorkspaceToServer(workspace: WorkspaceState): Promise<WorkspaceState> {
+  const importedProjects: HydratedProjectRecord[] = [];
+
+  for (const project of workspace.projects) {
+    const created = await createServerProject(project.name);
+    let latest = created;
+    const remainingSnapshots = [...project.snapshots].sort(
+      (left, right) => new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime(),
+    );
+    const importedSnapshotVersions = new Map<string, number>();
+
+    while (remainingSnapshots.length > 0) {
+      let progressed = false;
+
+      for (let index = 0; index < remainingSnapshots.length; index += 1) {
+        const snapshot = remainingSnapshots[index];
+        const parentVersion = snapshot.parentSnapshotId
+          ? importedSnapshotVersions.get(snapshot.parentSnapshotId)
+          : null;
+
+        if (snapshot.parentSnapshotId && typeof parentVersion !== 'number') {
+          continue;
+        }
+
+        latest = await saveProjectPackage({
+          projectId: latest.id,
+          pkg: snapshot.pkg,
+          source: 'import',
+          parentVersion: parentVersion ?? null,
+          localSnapshotId: snapshot.id,
+          evaluator: snapshot.evaluator,
+        });
+        importedSnapshotVersions.set(snapshot.id, latest.currentVersion);
+        remainingSnapshots.splice(index, 1);
+        progressed = true;
+        break;
+      }
+
+      if (!progressed) {
+        throw new Error(`Unable to preserve snapshot lineage while importing project ${project.name}.`);
+      }
+    }
+
+    if (project.currentPackage && !project.snapshots.some(snapshot => snapshot.pkg.manifestJson === project.currentPackage?.manifestJson)) {
+      latest = await saveProjectPackage({
+        projectId: latest.id,
+        pkg: project.currentPackage,
+        source: 'import',
+        parentVersion: latest.currentVersion || null,
+        evaluator: project.currentEvaluator,
+      });
+    }
+
+    importedProjects.push(latest);
+  }
+
+  return mergeServerProjects(importedProjects, workspace);
 }
 
 export async function loadWorkspaceState(): Promise<WorkspaceState> {
   const indexed = await loadFromIndexedDb().catch(() => null);
-  if (indexed) {
-    return indexed;
-  }
+  const cachedWorkspace = indexed ?? loadFromLocalFallback();
 
-  const fallback = loadFromLocalFallback();
-  if (fallback) {
-    return fallback;
-  }
+  try {
+    let projects = await listProjects();
+    if (projects.length === 0) {
+      if (cachedWorkspace?.projects.length) {
+        return await importCachedWorkspaceToServer(cachedWorkspace);
+      }
 
-  const migrated = migrateLegacyArchives();
-  if (migrated) {
-    return migrated;
-  }
+      const created = await createServerProject('Project 1');
+      projects = [created];
+    }
 
-  return createDefaultWorkspace('Project 1');
+    return mergeServerProjects(projects, cachedWorkspace);
+  } catch {
+    if (cachedWorkspace) {
+      return cachedWorkspace;
+    }
+
+    const migrated = migrateLegacyArchives();
+    if (migrated) {
+      return migrated;
+    }
+
+    return createDefaultWorkspace('Project 1');
+  }
 }
 
 export async function saveWorkspaceState(workspace: WorkspaceState): Promise<void> {

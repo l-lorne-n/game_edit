@@ -5,22 +5,28 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ModelAttempt } from '@/lib/ai/types';
 import type { EvaluatorResult } from '@/lib/evaluator/types';
 import type { GamePackageManifest, GeneratedGamePackage } from '@/lib/package/contracts';
+import {
+  createProject as createServerProject,
+  deleteProject as deleteServerProject,
+  restoreProjectVersion,
+  saveProjectPackage,
+  updateProjectEvaluation,
+} from '@/lib/projects/client';
+import { versionFromSnapshotId } from '@/lib/projects/package-files';
 import { buildSnapshotDisplay } from '@/lib/workspace/state';
 import { decideRoute } from '@/lib/workspace/routing';
 import {
   addProject,
   appendMessages,
   archiveCurrentPackage,
-  createDefaultWorkspace,
   deleteProject,
   getActiveProject,
   makeChatMessage,
-  removeSnapshotSubtree,
   resolvePackageFromTarget,
   snapshotDescendantIds,
   updateProject,
 } from '@/lib/workspace/state';
-import { loadWorkspaceState, saveWorkspaceState } from '@/lib/workspace/storage';
+import { loadWorkspaceState, mergeServerProjectIntoWorkspace, saveWorkspaceState } from '@/lib/workspace/storage';
 import type {
   ActionMode,
   ExecutionTrace,
@@ -45,6 +51,8 @@ type PackageApiSuccess = {
   provider: string;
   model: string;
   attempts: ModelAttempt[];
+  project: import('@/lib/projects/types').HydratedProjectRecord | null;
+  persistenceWarning?: string | null;
 };
 
 type PackageApiFailure = {
@@ -158,6 +166,18 @@ function plausibleDebugTargets(project: GameProject): string[] {
     }
   }
   return [...ids];
+}
+
+function getHeadVersion(project: GameProject): number {
+  const versions = project.snapshots
+    .map(snapshot => versionFromSnapshotId(snapshot.id))
+    .filter((value): value is number => typeof value === 'number');
+
+  return versions.length > 0 ? Math.max(...versions) : 0;
+}
+
+function isServerBackedProject(project: GameProject): boolean {
+  return project.persistenceMode === 'server';
 }
 
 async function postJson(path: string, payload: unknown): Promise<ApiResponse> {
@@ -283,21 +303,33 @@ export default function CodegenAppShell() {
     }));
   }
 
-  function handleCreateProject(): void {
-    if (!workspace) {
+  async function handleCreateProject(): Promise<void> {
+    if (!workspace || busy) {
       return;
     }
-    const name = `Project ${workspace.projects.length + 1}`;
-    const result = addProject(workspace, name);
-    if (!result.ok) {
-      window.alert(`Project limit reached (${workspace.limits.maxProjects}).`);
-      return;
+    setBusy(true);
+    try {
+      const name = `Project ${workspace.projects.length + 1}`;
+      const createdProject = await createServerProject(name);
+      setWorkspace(prev => (prev ? mergeServerProjectIntoWorkspace(prev, createdProject) : prev));
+      setMode('create');
+      setComposerText('');
+      setPhases(defaultPhases());
+      window.setTimeout(() => inputRef.current?.focus(), 0);
+    } catch (error) {
+      const allowLocalFallback = !workspace.projects.some(project => isServerBackedProject(project));
+      const result = addProject(workspace, `Project ${workspace.projects.length + 1}`);
+      if (allowLocalFallback && result.ok) {
+        setWorkspace(result.workspace);
+        setMode('create');
+        setComposerText('');
+        setPhases(defaultPhases());
+      } else {
+        window.alert(error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      setBusy(false);
     }
-
-    setWorkspace(result.workspace);
-    setMode('create');
-    setComposerText('');
-    window.setTimeout(() => inputRef.current?.focus(), 0);
   }
 
   function handleSelectProject(projectId: string): void {
@@ -319,8 +351,8 @@ export default function CodegenAppShell() {
     window.setTimeout(() => inputRef.current?.focus(), 0);
   }
 
-  function handleDeleteProject(): void {
-    if (!activeProject || !workspace) {
+  async function handleDeleteProject(): Promise<void> {
+    if (!activeProject || !workspace || busy) {
       return;
     }
     const first = window.confirm(`Delete project "${activeProject.name}"?`);
@@ -333,114 +365,149 @@ export default function CodegenAppShell() {
     if (!second) {
       return;
     }
-    const next = deleteProject(workspace, activeProject.id);
-    setWorkspace(next);
-    setMode(getActiveProject(next)?.lastMode ?? 'create');
-    setComposerText('');
-    setPhases(defaultPhases());
-    window.setTimeout(() => inputRef.current?.focus(), 0);
+    setBusy(true);
+    try {
+      await deleteServerProject(activeProject.id);
+      const next = await loadWorkspaceState();
+      setWorkspace(next);
+      setMode(getActiveProject(next)?.lastMode ?? 'create');
+      setComposerText('');
+      setPhases(defaultPhases());
+      window.setTimeout(() => inputRef.current?.focus(), 0);
+    } catch (error) {
+      if (isServerBackedProject(activeProject)) {
+        window.alert(error instanceof Error ? error.message : String(error));
+      } else {
+        const next = deleteProject(workspace, activeProject.id);
+        setWorkspace(next);
+        setMode(getActiveProject(next)?.lastMode ?? 'create');
+        setComposerText('');
+        setPhases(defaultPhases());
+      }
+    } finally {
+      setBusy(false);
+    }
   }
 
-  function handleArchiveSnapshot(): void {
-    if (!activeProject || !workspace) {
+  async function handleArchiveSnapshot(): Promise<void> {
+    if (!activeProject || !activeProject.currentPackage || busy) {
       return;
     }
-    const parentSnapshotId =
-      mode === 'modify'
-        ? effectiveModifyBaseId !== '__current__'
-          ? effectiveModifyBaseId
-          : null
-        : mode === 'debug'
-          ? effectiveDebugTargetId !== '__current__'
-            ? effectiveDebugTargetId
-            : null
-          : activeProject.selectedSnapshotId || null;
-
-    const result = archiveCurrentPackage(activeProject, { parentSnapshotId });
-    if (!result.ok) {
-      const text =
-        result.error === 'MISSING_CURRENT_PACKAGE'
-          ? 'No current package to archive yet.'
-          : `Snapshot limit reached (${workspace.limits.maxSnapshotsPerProject}).`;
-      mutateActiveProject(project =>
-        appendMessages(project, [
-          makeChatMessage({
-            role: 'system',
-            mode: 'system',
-            text,
-          }),
-        ]),
-      );
-      return;
+    setBusy(true);
+    try {
+      const persistedProject = await saveProjectPackage({
+        projectId: activeProject.id,
+        pkg: activeProject.currentPackage,
+        source: 'archive',
+        parentVersion: getHeadVersion(activeProject) || null,
+      });
+      setWorkspace(prev => {
+        if (!prev) {
+          return prev;
+        }
+        const merged = mergeServerProjectIntoWorkspace(prev, persistedProject);
+        return updateProject(merged, activeProject.id, project => ({
+          ...project,
+          messages: [
+            ...project.messages,
+            makeChatMessage({
+              role: 'system',
+              mode: 'system',
+              text: 'Archived the current server-backed version.',
+            }),
+          ],
+        }));
+      });
+    } catch (error) {
+      if (isServerBackedProject(activeProject)) {
+        window.alert(error instanceof Error ? error.message : String(error));
+      } else {
+        const result = archiveCurrentPackage(activeProject, {
+          parentSnapshotId: activeProject.selectedSnapshotId || null,
+        });
+        if (result.ok) {
+          mutateActiveProject(project => ({
+            ...result.project,
+            messages: [
+              ...project.messages,
+              makeChatMessage({
+                role: 'system',
+                mode: 'system',
+                text: 'Archived snapshot locally because server persistence is unavailable.',
+              }),
+            ],
+          }));
+        } else {
+          window.alert(error instanceof Error ? error.message : String(error));
+        }
+      }
+    } finally {
+      setBusy(false);
     }
-
-    mutateActiveProject(project => ({
-      ...result.project,
-      selectedModifyBaseId: result.snapshot.id,
-      selectedDebugTargetId: result.snapshot.id,
-      messages: [
-        ...project.messages,
-        makeChatMessage({
-          role: 'system',
-          mode: 'system',
-          text: `Archived snapshot: ${result.snapshot.title}`,
-        }),
-      ],
-    }));
   }
 
-  function handleRestoreSnapshot(): void {
+  async function handleRestoreSnapshot(): Promise<void> {
     if (!activeProject || !selectedSnapshot) {
       return;
     }
-    mutateActiveProject(project => ({
-      ...project,
-      currentPackage: selectedSnapshot.pkg,
-      currentEvaluator: selectedSnapshot.evaluator,
-      selectedModifyBaseId: selectedSnapshot.id,
-      selectedDebugTargetId: selectedSnapshot.id,
-      messages: [
-        ...project.messages,
-        makeChatMessage({
-          role: 'system',
-          mode: 'system',
-          text: `Restored snapshot: ${selectedSnapshot.title}`,
-        }),
-      ],
-    }));
-    setRuntimeNonce(prev => prev + 1);
+    const targetVersion = versionFromSnapshotId(selectedSnapshot.id);
+    if (!targetVersion) {
+      window.alert('Selected snapshot does not map to a server version.');
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const restoredProject = await restoreProjectVersion(activeProject.id, targetVersion);
+      setWorkspace(prev => {
+        if (!prev) {
+          return prev;
+        }
+        const merged = mergeServerProjectIntoWorkspace(prev, restoredProject);
+        return updateProject(merged, activeProject.id, project => ({
+          ...project,
+          messages: [
+            ...project.messages,
+            makeChatMessage({
+              role: 'system',
+              mode: 'system',
+              text: `Restored version ${targetVersion} into a new head version.`,
+            }),
+          ],
+        }));
+      });
+      setRuntimeNonce(prev => prev + 1);
+    } catch (error) {
+      if (isServerBackedProject(activeProject)) {
+        window.alert(error instanceof Error ? error.message : String(error));
+      } else {
+        mutateActiveProject(project => ({
+          ...project,
+          currentPackage: selectedSnapshot.pkg,
+          currentEvaluator: selectedSnapshot.evaluator,
+          selectedModifyBaseId: selectedSnapshot.id,
+          selectedDebugTargetId: selectedSnapshot.id,
+          messages: [
+            ...project.messages,
+            makeChatMessage({
+              role: 'system',
+              mode: 'system',
+              text: `Restored snapshot locally: ${selectedSnapshot.title}`,
+            }),
+          ],
+        }));
+        setRuntimeNonce(prev => prev + 1);
+      }
+    } finally {
+      setBusy(false);
+    }
   }
 
   function handleDeleteSnapshot(): void {
     if (!activeProject || !selectedSnapshot) {
       return;
     }
-    const descendants = snapshotDescendantIds(activeProject.snapshots, selectedSnapshot.id);
-    const confirmText =
-      descendants.length > 0
-        ? `Delete snapshot "${selectedSnapshot.title}" and ${descendants.length} descendant snapshot(s)?`
-        : `Delete snapshot "${selectedSnapshot.title}"?`;
-    if (!window.confirm(confirmText)) {
-      return;
-    }
-
-    mutateActiveProject(project => {
-      const next = removeSnapshotSubtree(project, selectedSnapshot.id);
-      return {
-        ...next,
-        messages: [
-          ...next.messages,
-          makeChatMessage({
-            role: 'system',
-            mode: 'system',
-            text:
-              descendants.length > 0
-                ? `Deleted snapshot branch: ${selectedSnapshot.title} + ${descendants.length} descendant(s).`
-                : `Deleted snapshot: ${selectedSnapshot.title}.`,
-          }),
-        ],
-      };
-    });
+    window.alert('Server-backed versions are immutable in this rehearsal. Use restore to fork a new head version instead.');
   }
 
   async function handleSubmit(): Promise<void> {
@@ -472,6 +539,7 @@ export default function CodegenAppShell() {
       endpoint = '/api/package/generate';
       payload = {
         prompt: text,
+        projectId: activeProject.id,
         lastKnownGoodPackage: activeProject.lastGreenSnapshotId
           ? activeProject.snapshots.find(snapshot => snapshot.id === activeProject.lastGreenSnapshotId)?.pkg
           : null,
@@ -492,6 +560,7 @@ export default function CodegenAppShell() {
       endpoint = '/api/package/modify';
       payload = {
         instruction: text,
+        projectId: activeProject.id,
         targetId,
         currentPackage: targetPackage,
         lastKnownGoodPackage: activeProject.lastGreenSnapshotId
@@ -516,6 +585,7 @@ export default function CodegenAppShell() {
       endpoint = '/api/package/debug';
       payload = {
         errorReport: text,
+        projectId: activeProject.id,
         targetId,
         currentPackage: targetPackage,
         evaluatorSummary: activeProject.currentEvaluator?.summary ?? '',
@@ -647,6 +717,7 @@ export default function CodegenAppShell() {
       `provider/model: ${response.provider} / ${response.model}`,
       `repaired: ${String(response.repaired)} | fallback: ${String(response.fallbackUsed)}`,
       `static: ${response.staticEvaluation.code}`,
+      response.persistenceWarning ? `persistence: ${response.persistenceWarning}` : null,
       fallbackReason,
     ].join('\n');
 
@@ -676,81 +747,65 @@ export default function CodegenAppShell() {
       },
     ]);
 
-    mutateActiveProject(project => {
-      const next = appendMessages(project, [
-        makeChatMessage({
-          role: 'assistant',
-          mode,
-          text: summary,
-        }),
-      ]);
+    setWorkspace(prev => {
+      if (!prev) {
+        return prev;
+      }
 
-      const withCurrent = {
-        ...next,
-        currentPackage: generated,
-        currentEvaluator: response.staticEvaluation,
-        attempts: response.attempts,
-        lastMode: mode,
-        lastRouteDecision: routeDecision,
-        lastExecutionTrace: {
-          requestMode: mode,
-          endpoint,
-          targetId: routeDecision.targetId,
-          roleLabel: generatorLabel,
-          statusMessage: response.statusMessage,
-          source: response.source,
-          provider: response.provider,
-          model: response.model,
-          repaired: response.repaired,
-          fallbackUsed: response.fallbackUsed,
-          staticCode: response.staticEvaluation.code,
-          testsRun: ['static-evaluator', 'sandbox-ready', 'sandbox-runTests'],
-          filesProduced: ['indexHtml', 'gameJs', 'styleCss', 'manifestJson'],
-          attemptSummaries: toAttemptSummaries(response.attempts),
-        },
-      };
+      const locallyUpdated = updateProject(prev, activeProject.id, project => {
+        const next = appendMessages(project, [
+          makeChatMessage({
+            role: 'assistant',
+            mode,
+            text: summary,
+          }),
+        ]);
 
-      const parentSnapshotId =
-        routeDecision.targetId !== '__current__'
-          ? routeDecision.targetId
-          : mode === 'create'
-            ? null
-            : project.selectedSnapshotId || null;
-
-      const archived = archiveCurrentPackage(withCurrent, { parentSnapshotId });
-      if (!archived.ok) {
-        const reason =
-          archived.error === 'MISSING_CURRENT_PACKAGE'
-            ? 'Auto-archive skipped: no current package.'
-            : `Auto-archive skipped: snapshot limit reached (${workspace?.limits.maxSnapshotsPerProject ?? 20}).`;
         return {
-          ...withCurrent,
+          ...next,
+          currentPackage: generated,
+          currentEvaluator: response.staticEvaluation,
+          attempts: response.attempts,
+          lastMode: mode,
+          lastRouteDecision: routeDecision,
+          lastExecutionTrace: {
+            requestMode: mode,
+            endpoint,
+            targetId: routeDecision.targetId,
+            roleLabel: generatorLabel,
+            statusMessage: response.statusMessage,
+            source: response.source,
+            provider: response.provider,
+            model: response.model,
+            repaired: response.repaired,
+            fallbackUsed: response.fallbackUsed,
+            staticCode: response.staticEvaluation.code,
+            testsRun: ['static-evaluator', 'sandbox-ready', 'sandbox-runTests'],
+            filesProduced: ['indexHtml', 'gameJs', 'styleCss', 'manifestJson'],
+            attemptSummaries: toAttemptSummaries(response.attempts),
+          },
+        };
+      });
+
+      if (response.project) {
+        return mergeServerProjectIntoWorkspace(locallyUpdated, response.project);
+      }
+
+      if (isServerBackedProject(activeProject)) {
+        return updateProject(prev, activeProject.id, project => ({
+          ...project,
           messages: [
-            ...withCurrent.messages,
+            ...project.messages,
             makeChatMessage({
               role: 'system',
               mode: 'system',
-              text: reason,
+              text: `Server persistence failed; the generated package was not adopted as the canonical head. ${response.persistenceWarning ?? ''}`.trim(),
             }),
           ],
-        };
+        }));
       }
 
-      return {
-        ...archived.project,
-        selectedModifyBaseId: archived.snapshot.id,
-        selectedDebugTargetId: archived.snapshot.id,
-        lastRouteDecision: routeDecision,
-        lastExecutionTrace: withCurrent.lastExecutionTrace,
-        messages: [
-          ...archived.project.messages,
-          makeChatMessage({
-            role: 'system',
-            mode: 'system',
-            text: `Auto archived snapshot: ${archived.snapshot.title}`,
-          }),
-        ],
-      };
+      return locallyUpdated;
     });
 
     setComposerText('');
@@ -803,6 +858,21 @@ export default function CodegenAppShell() {
           }
         : project.lastExecutionTrace,
     }));
+
+    if (isServerBackedProject(activeProject)) {
+      const currentHeadVersion = getHeadVersion(activeProject);
+      if (currentHeadVersion > 0) {
+        void updateProjectEvaluation({
+          projectId: activeProject.id,
+          version: currentHeadVersion,
+          evaluator: result,
+        })
+          .then(project => {
+            setWorkspace(prev => (prev ? mergeServerProjectIntoWorkspace(prev, project) : prev));
+          })
+          .catch(() => undefined);
+      }
+    }
   }
 
   if (!workspaceReady || !workspace || !activeProject) {
@@ -836,7 +906,7 @@ export default function CodegenAppShell() {
         <aside className={styles.panel}>
           <div className={styles.row}>
             <strong>Projects</strong>
-            <button className={styles.btnPrimary} type="button" onClick={handleCreateProject} disabled={busy}>
+             <button className={styles.btnPrimary} type="button" onClick={() => void handleCreateProject()} disabled={busy}>
               + New
             </button>
           </div>
@@ -858,7 +928,7 @@ export default function CodegenAppShell() {
             ))}
           </div>
 
-          <button className={styles.btnDanger} type="button" onClick={handleDeleteProject} disabled={busy}>
+           <button className={styles.btnDanger} type="button" onClick={() => void handleDeleteProject()} disabled={busy}>
             Delete Active Project
           </button>
         </aside>
@@ -1061,15 +1131,15 @@ export default function CodegenAppShell() {
               ))}
             </select>
 
-            <button className={styles.btn} type="button" onClick={handleRestoreSnapshot} disabled={!selectedSnapshot || busy}>
+             <button className={styles.btn} type="button" onClick={() => void handleRestoreSnapshot()} disabled={!selectedSnapshot || busy}>
               Restore
             </button>
-            <button className={styles.btn} type="button" onClick={handleArchiveSnapshot} disabled={busy || !activeProject.currentPackage}>
+             <button className={styles.btn} type="button" onClick={() => void handleArchiveSnapshot()} disabled={busy || !activeProject.currentPackage}>
               Archive Snapshot
             </button>
-            <button className={styles.btnDanger} type="button" onClick={handleDeleteSnapshot} disabled={!selectedSnapshot || busy}>
-              Delete Snapshot
-            </button>
+             <button className={styles.btnDanger} type="button" onClick={handleDeleteSnapshot} disabled>
+               Delete Snapshot
+             </button>
           </div>
 
           <div className={styles.previewBody}>

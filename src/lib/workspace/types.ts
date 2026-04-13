@@ -29,6 +29,7 @@ export type GameProject = {
   name: string;
   createdAt: string;
   updatedAt: string;
+  persistenceMode: 'local' | 'server';
   messages: ChatMessage[];
   currentPackage: GeneratedGamePackage | null;
   currentEvaluator: EvaluatorResult | null;
