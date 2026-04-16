@@ -1,6 +1,12 @@
 import { NextResponse } from 'next/server';
 
-import { generatePackageFromPrompt } from '@/lib/ai/generate-package';
+import {
+  AiSessionMessageNotReadyError,
+  AiSessionTransportNotImplementedError,
+  AiSessionTransportNotInitializedError,
+} from '@/lib/ai-sessions/service';
+import { runCodexPackageTask } from '@/lib/ai/codex-package-task';
+import { computePackageRouteDecision } from '@/lib/ai/package-route-decision';
 import { parseGeneratedGamePackage } from '@/lib/package/contracts';
 import { createProjectService } from '@/lib/projects/service';
 
@@ -12,6 +18,7 @@ export async function POST(request: Request) {
       prompt?: string;
       lastKnownGoodPackage?: unknown;
       projectId?: string;
+      aiSessionId?: string;
     };
 
     const prompt = body.prompt?.trim();
@@ -22,11 +29,24 @@ export async function POST(request: Request) {
     const parsedLastGood = body.lastKnownGoodPackage
       ? parseGeneratedGamePackage(body.lastKnownGoodPackage)
       : null;
+    const serverRouteDecision = computePackageRouteDecision({
+      mode: 'create',
+      requestText: prompt,
+      targetId: '__current__',
+      targetPackage: null,
+    });
 
-    const result = await generatePackageFromPrompt(
-      prompt,
-      parsedLastGood?.ok ? parsedLastGood.pkg : undefined,
-    );
+    const result = await runCodexPackageTask({
+      mode: 'create',
+        projectId: body.projectId,
+        aiSessionId: body.aiSessionId,
+        prompt,
+        lastKnownGoodPackage: parsedLastGood?.ok ? parsedLastGood.pkg : undefined,
+        routeMode: serverRouteDecision.routeMode,
+        routeReason: serverRouteDecision.primaryReasonCode,
+        allowedPaths: serverRouteDecision.allowedPaths,
+        checkpointOnSuccess: true,
+      });
 
     let persistedProject = null;
     let persistenceWarning: string | null = null;
@@ -34,10 +54,10 @@ export async function POST(request: Request) {
       try {
         persistedProject = await projectService.saveGeneratedPackage({
           projectId: body.projectId,
-          pkg: result.pkg,
+          pkg: result.solveResult.pkg,
           source: 'generate',
           parentVersion: (await projectService.getProject(body.projectId))?.currentVersion ?? null,
-          evaluator: result.staticEvaluation,
+          evaluator: result.solveResult.staticEvaluation,
         });
       } catch (error) {
         persistenceWarning = error instanceof Error ? error.message : 'Project persistence is unavailable.';
@@ -47,20 +67,28 @@ export async function POST(request: Request) {
     return NextResponse.json({
       ok: true,
       prompt,
-      package: result.pkg,
-      manifest: result.manifest,
-      staticEvaluation: result.staticEvaluation,
-      repaired: result.repaired,
-      fallbackUsed: result.fallbackUsed,
-      source: result.source,
-      statusMessage: result.statusMessage,
-      provider: result.provider,
-      model: result.model,
-      attempts: result.attempts,
+      package: result.solveResult.pkg,
+      manifest: result.solveResult.manifest,
+      staticEvaluation: result.solveResult.staticEvaluation,
+      repaired: result.solveResult.repaired,
+      fallbackUsed: result.solveResult.fallbackUsed,
+      source: result.solveResult.source,
+      statusMessage: result.solveResult.statusMessage,
+      provider: result.solveResult.provider,
+      model: result.solveResult.model,
+      attempts: result.solveResult.attempts,
+      executionEngine: result.executionTraceMeta,
+      serverRouteDecision,
       project: persistedProject,
       persistenceWarning,
     });
   } catch (error) {
+    if (error instanceof AiSessionTransportNotInitializedError || error instanceof AiSessionMessageNotReadyError) {
+      return NextResponse.json({ ok: false, error: error.message, code: error.code }, { status: 409 });
+    }
+    if (error instanceof AiSessionTransportNotImplementedError) {
+      return NextResponse.json({ ok: false, error: error.message, code: error.reason }, { status: 502 });
+    }
     return NextResponse.json(
       {
         ok: false,

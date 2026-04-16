@@ -22,7 +22,51 @@ function escScript(text: string): string {
   return text.replace(/<\/script>/gi, '<\\/script>');
 }
 
-function buildSandboxDoc(pkg: GeneratedGamePackage): string {
+function buildStorageShim(): string {
+  return `
+(() => {
+  const makeMemoryStorage = () => {
+    const store = new Map();
+    return {
+      get length() { return store.size; },
+      clear() { store.clear(); },
+      getItem(key) { return store.has(String(key)) ? store.get(String(key)) : null; },
+      key(index) { return Array.from(store.keys())[index] ?? null; },
+      removeItem(key) { store.delete(String(key)); },
+      setItem(key, value) { store.set(String(key), String(value)); },
+    };
+  };
+
+  const installFallback = (name) => {
+    let works = false;
+    try {
+      const probe = window[name];
+      const testKey = '__game_edit_probe__';
+      probe.setItem(testKey, '1');
+      probe.removeItem(testKey);
+      works = true;
+    } catch {
+      works = false;
+    }
+
+    if (!works) {
+      const fallback = makeMemoryStorage();
+      Object.defineProperty(window, name, {
+        configurable: true,
+        enumerable: true,
+        writable: false,
+        value: fallback,
+      });
+    }
+  };
+
+  installFallback('localStorage');
+  installFallback('sessionStorage');
+})();
+`.trim();
+}
+
+export function buildSandboxDoc(pkg: GeneratedGamePackage): string {
   const bridge = `
 (() => {
   const CHANNEL = 'game_edit_sandbox';
@@ -122,6 +166,7 @@ function buildSandboxDoc(pkg: GeneratedGamePackage): string {
   <body>
     ${pkg.indexHtml}
     <script>${escScript(bridge)}</script>
+    <script>${escScript(buildStorageShim())}</script>
     <script>${escScript(pkg.gameJs)}</script>
   </body>
 </html>`;

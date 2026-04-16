@@ -3,7 +3,22 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 
 import type { ModelAttempt } from '@/lib/ai/types';
+import {
+  AiSessionClientError,
+  beginHostBrowserOAuth,
+  checkpointAiSession,
+  createAiSession,
+  getAiSessionLogs,
+  getAiSessionSnapshot,
+  getLatestHostTokenSession,
+  initAiSessionTransport,
+  listProjectAiSessions,
+  revokeAiSession,
+  type AiSessionSnapshot,
+} from '@/lib/ai-sessions/client';
+import type { AiSessionTransportLogEntry, AiSessionTransportSnapshot } from '@/lib/ai-sessions/types';
 import type { EvaluatorResult } from '@/lib/evaluator/types';
+import type { HostTokenSessionMetadata } from '@/lib/host-tokens/types';
 import type { GamePackageManifest, GeneratedGamePackage } from '@/lib/package/contracts';
 import {
   createProject as createServerProject,
@@ -37,6 +52,7 @@ import type {
 } from '@/lib/workspace/types';
 import RequestWorkbench from '@/components/RequestWorkbench';
 import SandboxPreview from '@/components/SandboxPreview';
+import CodexPanel from '@/components/CodexPanel';
 import styles from '@/components/CodegenAppShell.module.css';
 
 type PackageApiSuccess = {
@@ -51,6 +67,16 @@ type PackageApiSuccess = {
   provider: string;
   model: string;
   attempts: ModelAttempt[];
+  requiresReplan?: boolean;
+  executionEngine?: {
+    requestedEngine: string;
+    actualEngine: string;
+    strategy: string;
+    routeReason: string | null;
+    allowedPaths: string[];
+    fallbackReason: string | null;
+  };
+  serverRouteDecision?: RouteDecision;
   project: import('@/lib/projects/types').HydratedProjectRecord | null;
   persistenceWarning?: string | null;
 };
@@ -58,6 +84,7 @@ type PackageApiSuccess = {
 type PackageApiFailure = {
   ok: false;
   error: string;
+  code?: string;
 };
 
 type ApiResponse = PackageApiSuccess | PackageApiFailure;
@@ -70,6 +97,12 @@ type PhaseRow = {
   state: PhaseState;
   detail: string;
   elapsedMs: number;
+};
+
+type CodexPanelState = {
+  transport: AiSessionTransportSnapshot | null;
+  initTranscript: AiSessionTransportLogEntry[];
+  turnTranscript: AiSessionTransportLogEntry[];
 };
 
 const MODES: Array<{ id: ActionMode; label: string }> = [
@@ -205,8 +238,14 @@ export default function CodegenAppShell() {
   const [composerText, setComposerText] = useState('');
   const [mode, setMode] = useState<ActionMode>('create');
   const [busy, setBusy] = useState(false);
+  const [hostAuthBusy, setHostAuthBusy] = useState(false);
+  const [sessionBusy, setSessionBusy] = useState(false);
   const [runtimeNonce, setRuntimeNonce] = useState(0);
   const [phases, setPhases] = useState<PhaseRow[]>(defaultPhases);
+  const [aiSessionSnapshots, setAiSessionSnapshots] = useState<Record<string, AiSessionSnapshot | null>>({});
+  const [codexPanels, setCodexPanels] = useState<Record<string, CodexPanelState | null>>({});
+  const [codexLogsBusy, setCodexLogsBusy] = useState(false);
+  const [hostAuthSession, setHostAuthSession] = useState<HostTokenSessionMetadata | null>(null);
 
   const phaseStartedRef = useRef<Record<'generator' | 'tester' | 'checker', number>>({
     generator: 0,
@@ -227,6 +266,12 @@ export default function CodegenAppShell() {
     [activeProject],
   );
 
+  const activeAiSessionSnapshot = activeProject ? aiSessionSnapshots[activeProject.id] ?? null : null;
+  const activeAiSession = activeAiSessionSnapshot?.session ?? null;
+  const activeCodexPanel = activeProject ? codexPanels[activeProject.id] ?? null : null;
+  const activeProjectId = activeProject?.id ?? null;
+  const activeAiSessionId = activeAiSession?.id ?? null;
+
   const targetOptions = useMemo(() => {
     const options = [
       {
@@ -246,10 +291,12 @@ export default function CodegenAppShell() {
 
     async function load() {
       const loaded = await loadWorkspaceState();
+      const latestHostSession = await getLatestHostTokenSession().catch(() => null);
       if (cancelled) {
         return;
       }
       setWorkspace(loaded);
+      setHostAuthSession(latestHostSession);
       const project = getActiveProject(loaded);
       setMode(project?.lastMode ?? 'create');
       setWorkspaceReady(true);
@@ -259,6 +306,52 @@ export default function CodegenAppShell() {
     load();
     return () => {
       cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!activeProjectId || !activeProject || !isServerBackedProject(activeProject)) {
+      return;
+    }
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        const sessions = await listProjectAiSessions(activeProjectId);
+        if (cancelled || sessions.length === 0) {
+          return;
+        }
+        const preferred = [...sessions].sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))[0];
+        if (!preferred) {
+          return;
+        }
+        await refreshAiSessionSnapshot(activeProjectId, preferred.id);
+      } catch {
+        // best-effort restoration only
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProject, activeProjectId]);
+
+  useEffect(() => {
+    const expectedOrigin = process.env.NEXT_PUBLIC_APP_URL ?? window.location.origin;
+
+    function handleHostAuthMessage(event: MessageEvent<unknown>) {
+      if (event.origin !== expectedOrigin) {
+        return;
+      }
+      const data = event.data as { type?: string; session?: HostTokenSessionMetadata } | null;
+      if (data?.type === 'host-auth-complete') {
+        void getLatestHostTokenSession().then(setHostAuthSession).catch(() => undefined);
+      }
+    }
+
+    window.addEventListener('message', handleHostAuthMessage);
+    return () => {
+      window.removeEventListener('message', handleHostAuthMessage);
     };
   }, []);
 
@@ -302,6 +395,250 @@ export default function CodegenAppShell() {
           : project.selectedModifyBaseId,
     }));
   }
+
+  async function refreshAiSessionSnapshot(projectId: string, sessionId: string): Promise<void> {
+    const snapshot = await getAiSessionSnapshot(sessionId);
+    setAiSessionSnapshots(prev => ({
+      ...prev,
+      [projectId]: snapshot,
+    }));
+  }
+
+  async function refreshCodexPanel(projectId: string, sessionId: string): Promise<void> {
+    const logs = await getAiSessionLogs(sessionId);
+    setCodexPanels(prev => ({
+      ...prev,
+      [projectId]: logs,
+    }));
+  }
+
+  async function ensureAiSessionReadyForSend(projectId: string): Promise<string> {
+    let session = activeAiSession;
+
+    if (!session) {
+      session = await createAiSession(projectId);
+      await refreshAiSessionSnapshot(projectId, session.id).catch(() => undefined);
+    }
+
+    const transportPhase = activeCodexPanel?.transport?.phase ?? activeAiSessionSnapshot?.transport?.phase ?? 'uninitialized';
+    if (transportPhase === 'ready') {
+      return session.id;
+    }
+
+    const hostSession = await getLatestHostTokenSession();
+    if (!hostSession?.bindToken) {
+      throw new Error('Connect OAuth before sending prompts.');
+    }
+
+    const initResult = await initAiSessionTransport(session.id, hostSession.bindToken);
+    await refreshAiSessionSnapshot(projectId, initResult.session.id).catch(() => undefined);
+    await refreshCodexPanel(projectId, initResult.session.id).catch(() => undefined);
+    return initResult.session.id;
+  }
+
+  async function handleCreateAiSession(): Promise<void> {
+    if (!activeProject || busy || sessionBusy || !isServerBackedProject(activeProject)) {
+      return;
+    }
+
+    const projectId = activeProject.id;
+
+    setSessionBusy(true);
+    try {
+      const session = await createAiSession(projectId);
+      await refreshAiSessionSnapshot(projectId, session.id);
+      setCodexPanels(prev => ({
+        ...prev,
+        [projectId]: {
+          transport: null,
+          initTranscript: [],
+          turnTranscript: [],
+        },
+      }));
+      mutateActiveProject(project =>
+        appendMessages(project, [
+          makeChatMessage({
+            role: 'system',
+            mode: 'system',
+            text: `AI session created: ${session.id}`,
+          }),
+        ]),
+      );
+    } finally {
+      setSessionBusy(false);
+    }
+  }
+
+  async function handleInitAiSession(): Promise<void> {
+    if (!activeProject || !activeAiSession || busy || sessionBusy) {
+      return;
+    }
+
+    const projectId = activeProject.id;
+    const sessionId = activeAiSession.id;
+
+    setSessionBusy(true);
+    try {
+      const hostSession = await getLatestHostTokenSession();
+      if (!hostSession?.bindToken) {
+        window.alert('No host token bind token is available. Complete host browser login first.');
+        return;
+      }
+
+      const result = await initAiSessionTransport(sessionId, hostSession.bindToken);
+      await refreshAiSessionSnapshot(projectId, result.session.id);
+      await refreshCodexPanel(projectId, result.session.id);
+      mutateActiveProject(project =>
+        appendMessages(project, [
+          makeChatMessage({
+            role: 'system',
+            mode: 'system',
+            text: `Codex initialized. Thread=${result.transport.threadId ?? 'pending'} phase=${result.transport.phase}`,
+          }),
+        ]),
+      );
+    } catch (error) {
+      await refreshAiSessionSnapshot(projectId, sessionId).catch(() => undefined);
+      await refreshCodexPanel(projectId, sessionId).catch(() => undefined);
+      mutateActiveProject(project =>
+        appendMessages(project, [
+          makeChatMessage({
+            role: 'assistant',
+            mode: 'system',
+            text:
+              error instanceof AiSessionClientError
+                ? `Init Codex failed: ${error.message}${error.code ? ` (${error.code})` : ''}`
+                : `Init Codex failed: ${error instanceof Error ? error.message : String(error)}`,
+          }),
+        ]),
+      );
+    } finally {
+      setSessionBusy(false);
+    }
+  }
+
+  async function handleStartHostAuth(): Promise<void> {
+    if (hostAuthBusy) {
+      return;
+    }
+
+    setHostAuthBusy(true);
+    try {
+      const start = await beginHostBrowserOAuth();
+      const popup = window.open(start.authorizeUrl, 'game_edit_host_oauth', 'popup,width=720,height=820');
+      if (!popup) {
+        window.location.href = start.authorizeUrl;
+        return;
+      }
+      const interval = window.setInterval(() => {
+        if (popup.closed) {
+          window.clearInterval(interval);
+          void getLatestHostTokenSession().then(setHostAuthSession).catch(() => undefined);
+        }
+      }, 1000);
+    } finally {
+      setHostAuthBusy(false);
+    }
+  }
+
+  async function handleCheckpointAiSession(): Promise<void> {
+    if (!activeProject || !activeAiSession || busy || sessionBusy) {
+      return;
+    }
+
+    setSessionBusy(true);
+    try {
+      const result = await checkpointAiSession(activeAiSession.id, `chk-${activeAiSession.id}-${Date.now()}`);
+      if (result.project) {
+        setWorkspace(prev => (prev ? mergeServerProjectIntoWorkspace(prev, result.project!) : prev));
+      }
+      await refreshAiSessionSnapshot(activeProject.id, activeAiSession.id);
+      mutateActiveProject(project =>
+        appendMessages(project, [
+          makeChatMessage({
+            role: 'system',
+            mode: 'system',
+            text:
+              result.checkpoint.status === 'conflict'
+                ? 'Checkpoint conflict: durable head moved ahead of this session base version.'
+                : `Checkpoint committed as version ${result.checkpoint.newVersion ?? 'unknown'}.`,
+          }),
+        ]),
+      );
+    } finally {
+      setSessionBusy(false);
+    }
+  }
+
+  async function handleRevokeAiSession(): Promise<void> {
+    if (!activeProject || !activeAiSession || busy || sessionBusy) {
+      return;
+    }
+
+    setSessionBusy(true);
+    try {
+      const session = await revokeAiSession(activeAiSession.id);
+      await refreshAiSessionSnapshot(activeProject.id, session.id);
+      setCodexPanels(prev => ({
+        ...prev,
+        [activeProject.id]: {
+          transport: null,
+          initTranscript: [],
+          turnTranscript: [],
+        },
+      }));
+      mutateActiveProject(project =>
+        appendMessages(project, [
+          makeChatMessage({
+            role: 'system',
+            mode: 'system',
+            text: `AI session revoked: ${session.id}`,
+          }),
+        ]),
+      );
+    } finally {
+      setSessionBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!activeProjectId || !activeAiSessionId) {
+      return;
+    }
+
+    const sessionId = activeAiSessionId;
+    const projectId = activeProjectId;
+
+    let cancelled = false;
+    async function syncLogs() {
+      try {
+        setCodexLogsBusy(true);
+        const logs = await getAiSessionLogs(sessionId);
+        if (!cancelled) {
+          setCodexPanels(prev => ({
+            ...prev,
+            [projectId]: logs,
+          }));
+        }
+      } catch {
+        // best-effort diagnostics only
+      } finally {
+        if (!cancelled) {
+          setCodexLogsBusy(false);
+        }
+      }
+    }
+
+    void syncLogs();
+    const timer = window.setInterval(() => {
+      void syncLogs();
+    }, 2000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeAiSessionId, activeProjectId]);
 
   async function handleCreateProject(): Promise<void> {
     if (!workspace || busy) {
@@ -525,88 +862,107 @@ export default function CodegenAppShell() {
       return;
     }
 
+    setBusy(true);
+
+    let ensuredAiSessionId: string | undefined;
+    if (isServerBackedProject(activeProject)) {
+      try {
+        ensuredAiSessionId = await ensureAiSessionReadyForSend(activeProject.id);
+      } catch (error) {
+        mutateActiveProject(project =>
+          appendMessages(project, [
+            makeChatMessage({
+              role: 'assistant',
+              mode,
+              text: `Request failed before send: ${error instanceof Error ? error.message : String(error)}`,
+            }),
+          ]),
+        );
+        setBusy(false);
+        return;
+      }
+    }
+
     let endpoint = '/api/package/generate';
     let payload: Record<string, unknown> = {};
-    let routeDecision: RouteDecision;
+      let clientRouteDecision: RouteDecision;
 
-    if (mode === 'create') {
-      routeDecision = decideRoute({
-        mode,
-        requestText: text,
-        targetId: '__current__',
-        targetPackage: activeProject.currentPackage,
+      if (mode === 'create') {
+        clientRouteDecision = decideRoute({
+          mode,
+          requestText: text,
+          targetId: '__current__',
+          targetPackage: activeProject.currentPackage,
       });
       endpoint = '/api/package/generate';
       payload = {
         prompt: text,
         projectId: activeProject.id,
+        aiSessionId: ensuredAiSessionId,
         lastKnownGoodPackage: activeProject.lastGreenSnapshotId
           ? activeProject.snapshots.find(snapshot => snapshot.id === activeProject.lastGreenSnapshotId)?.pkg
           : null,
       };
-    } else if (mode === 'modify') {
-      const targetId = effectiveModifyBaseId;
-      const targetPackage = resolvePackageFromTarget(activeProject, targetId);
-      if (!targetPackage) {
-        window.alert('No modify baseline selected.');
-        return;
-      }
-      routeDecision = decideRoute({
-        mode,
-        requestText: text,
-        targetId,
-        targetPackage,
+      } else if (mode === 'modify') {
+        const targetId = effectiveModifyBaseId;
+        const targetPackage = resolvePackageFromTarget(activeProject, targetId);
+        if (!targetPackage) {
+          window.alert('No modify baseline selected.');
+          return;
+        }
+        clientRouteDecision = decideRoute({
+          mode,
+          requestText: text,
+          targetId,
+          targetPackage,
       });
       endpoint = '/api/package/modify';
       payload = {
         instruction: text,
         projectId: activeProject.id,
-        targetId,
-        currentPackage: targetPackage,
-        lastKnownGoodPackage: activeProject.lastGreenSnapshotId
-          ? activeProject.snapshots.find(snapshot => snapshot.id === activeProject.lastGreenSnapshotId)?.pkg
-          : null,
-        routeMode: routeDecision.routeMode,
-        routeReason: routeDecision.primaryReasonCode,
-      };
-    } else {
-      const targetId = effectiveDebugTargetId || '__current__';
-      const targetPackage = resolvePackageFromTarget(activeProject, targetId);
-      if (!targetPackage) {
-        window.alert('No debug target selected.');
-        return;
-      }
-      routeDecision = decideRoute({
-        mode,
-        requestText: text,
-        targetId,
-        targetPackage,
+          aiSessionId: ensuredAiSessionId,
+          targetId,
+          currentPackage: targetPackage,
+          lastKnownGoodPackage: activeProject.lastGreenSnapshotId
+            ? activeProject.snapshots.find(snapshot => snapshot.id === activeProject.lastGreenSnapshotId)?.pkg
+            : null,
+        };
+      } else {
+        const targetId = effectiveDebugTargetId || '__current__';
+        const targetPackage = resolvePackageFromTarget(activeProject, targetId);
+        if (!targetPackage) {
+          window.alert('No debug target selected.');
+          return;
+        }
+        clientRouteDecision = decideRoute({
+          mode,
+          requestText: text,
+          targetId,
+          targetPackage,
       });
       endpoint = '/api/package/debug';
       payload = {
         errorReport: text,
         projectId: activeProject.id,
+        aiSessionId: ensuredAiSessionId,
         targetId,
-        currentPackage: targetPackage,
-        evaluatorSummary: activeProject.currentEvaluator?.summary ?? '',
-        lastKnownGoodPackage: activeProject.lastGreenSnapshotId
-          ? activeProject.snapshots.find(snapshot => snapshot.id === activeProject.lastGreenSnapshotId)?.pkg
-          : null,
-        routeMode: routeDecision.routeMode,
-        routeReason: routeDecision.primaryReasonCode,
-      };
-    }
+          currentPackage: targetPackage,
+          evaluatorSummary: activeProject.currentEvaluator?.summary ?? '',
+          lastKnownGoodPackage: activeProject.lastGreenSnapshotId
+            ? activeProject.snapshots.find(snapshot => snapshot.id === activeProject.lastGreenSnapshotId)?.pkg
+            : null,
+        };
+      }
 
-    const generatorLabel = labelForAgent(routeDecision.agent);
+      const generatorLabel = labelForAgent(clientRouteDecision.agent);
 
-    setBusy(true);
     phaseStartedRef.current.generator = nowMs();
     setPhases([
       {
         id: 'generator',
         label: generatorLabel,
         state: mode === 'debug' ? 'repairing' : 'running',
-        detail: `${routeDecision.summary} ${mode === 'debug' ? '正在修复错误...' : mode === 'modify' ? '正在应用修改...' : '正在生成项目包...'}`,
+        detail: `${clientRouteDecision.summary} ${mode === 'debug' ? '正在修复错误...' : mode === 'modify' ? '正在应用修改...' : '正在生成项目包...'}`,
         elapsedMs: 0,
       },
       {
@@ -634,7 +990,7 @@ export default function CodegenAppShell() {
             text,
           }),
         ]),
-        lastRouteDecision: routeDecision,
+        lastRouteDecision: clientRouteDecision,
       }),
     );
 
@@ -683,7 +1039,7 @@ export default function CodegenAppShell() {
           lastExecutionTrace: {
             requestMode: mode,
             endpoint,
-            targetId: routeDecision.targetId,
+            targetId: clientRouteDecision.targetId,
             roleLabel: generatorLabel,
             statusMessage: response.error,
             source: 'request-error',
@@ -702,8 +1058,9 @@ export default function CodegenAppShell() {
       return;
     }
 
-    const generated = response.package;
-    const latestAttempt = response.attempts.at(-1);
+      const generated = response.package;
+      const routeDecision = response.serverRouteDecision ?? clientRouteDecision;
+      const latestAttempt = response.attempts.at(-1);
     const fallbackReason = response.fallbackUsed
       ? latestAttempt?.outcome === 'timeout'
         ? `fallback reason: model timeout (${latestAttempt.durationMs || 60000}ms limit)`
@@ -714,11 +1071,18 @@ export default function CodegenAppShell() {
     const summary = [
       response.statusMessage,
       `source: ${response.source}`,
-      `provider/model: ${response.provider} / ${response.model}`,
-      `repaired: ${String(response.repaired)} | fallback: ${String(response.fallbackUsed)}`,
-      `static: ${response.staticEvaluation.code}`,
-      response.persistenceWarning ? `persistence: ${response.persistenceWarning}` : null,
-      fallbackReason,
+        `provider/model: ${response.provider} / ${response.model}`,
+        `repaired: ${String(response.repaired)} | fallback: ${String(response.fallbackUsed)}`,
+        response.requiresReplan ? 'route: replan required' : null,
+        response.executionEngine
+          ? `engine requested/actual/strategy: ${response.executionEngine.requestedEngine} / ${response.executionEngine.actualEngine} / ${response.executionEngine.strategy}`
+          : null,
+        response.executionEngine?.fallbackReason
+          ? `engine fallback: ${response.executionEngine.fallbackReason}`
+          : null,
+        `static: ${response.staticEvaluation.code}`,
+        response.persistenceWarning ? `persistence: ${response.persistenceWarning}` : null,
+        fallbackReason,
     ].join('\n');
 
     const elapsed = Math.max(0, nowMs() - phaseStartedRef.current.generator);
@@ -779,7 +1143,9 @@ export default function CodegenAppShell() {
             model: response.model,
             repaired: response.repaired,
             fallbackUsed: response.fallbackUsed,
-            staticCode: response.staticEvaluation.code,
+            staticCode: response.requiresReplan
+              ? `${response.staticEvaluation.code} [${response.executionEngine?.strategy ?? 'replan_required'}]`
+              : response.staticEvaluation.code,
             testsRun: ['static-evaluator', 'sandbox-ready', 'sandbox-runTests'],
             filesProduced: ['indexHtml', 'gameJs', 'styleCss', 'manifestJson'],
             attemptSummaries: toAttemptSummaries(response.attempts),
@@ -894,6 +1260,10 @@ export default function CodegenAppShell() {
   const looksLikeDebug = inferDebugSuggestion(composerText);
   const requireDebugTargetChoice = mode === 'debug' && debugTargets.length > 1 && !effectiveDebugTargetId;
   const selectedPreviewLabel = parseManifestTitle(activeProject.currentPackage);
+  const codexReady =
+    !isServerBackedProject(activeProject) ||
+    activeCodexPanel?.transport?.phase === 'ready' ||
+    activeAiSessionSnapshot?.transport?.phase === 'ready';
 
   return (
     <main className={styles.main}>
@@ -1079,7 +1449,97 @@ export default function CodegenAppShell() {
               </button>
               <span className={styles.mono}>{busy ? 'Working...' : 'Idle'}</span>
             </div>
+            {!codexReady ? <span className={styles.mono}>Send will auto-initialize Codex if OAuth is ready.</span> : null}
           </div>
+
+          {isServerBackedProject(activeProject) ? (
+            <div className={styles.panel} style={{ padding: 8 }}>
+              <div className={styles.row}>
+                <strong>Host OAuth</strong>
+                <span className={styles.mono}>{hostAuthBusy ? 'Authorizing...' : hostAuthSession ? 'Connected' : 'Not connected'}</span>
+              </div>
+
+              <pre className={styles.mono} style={{ whiteSpace: 'pre-wrap', margin: '8px 0' }}>
+                {JSON.stringify(
+                  hostAuthSession
+                    ? {
+                        sessionId: hostAuthSession.sessionId,
+                        accountId: hostAuthSession.accountId,
+                        expiresAt: hostAuthSession.expiresAt,
+                        bindTokenPresent: Boolean(hostAuthSession.bindToken),
+                        revoked: Boolean(hostAuthSession.revoked),
+                      }
+                    : { connected: false },
+                  null,
+                  2,
+                )}
+              </pre>
+
+              <div className={styles.row}>
+                <button className={styles.btn} type="button" onClick={() => void handleStartHostAuth()} disabled={hostAuthBusy || busy || sessionBusy}>
+                  {hostAuthSession ? 'Reconnect OAuth' : 'Connect OAuth'}
+                </button>
+              </div>
+
+              <div className={styles.row}>
+                <strong>AI Session</strong>
+                <span className={styles.mono}>{sessionBusy ? 'Session working...' : activeAiSession ? activeAiSession.status : 'No session'}</span>
+              </div>
+
+              <pre className={styles.mono} style={{ whiteSpace: 'pre-wrap', margin: '8px 0' }}>
+                {activeAiSessionSnapshot
+                  ? JSON.stringify(
+                      {
+                        sessionId: activeAiSessionSnapshot.session.id,
+                        status: activeAiSessionSnapshot.session.status,
+                        authState: activeAiSessionSnapshot.session.authState,
+                        boxId: activeAiSessionSnapshot.session.boxId,
+                        boxStatus: activeAiSessionSnapshot.session.boxStatus,
+                        appServerStatus: activeAiSessionSnapshot.session.appServerStatus,
+                        transportPhase: activeAiSessionSnapshot.transport?.phase ?? 'uninitialized',
+                        lastCheckpointVersion: activeAiSessionSnapshot.session.lastCheckpointVersion,
+                        recentEvents: activeAiSessionSnapshot.events.map(event => event.type),
+                      },
+                      null,
+                      2,
+                    )
+                  : 'No AI session created for this project yet.'}
+              </pre>
+
+              <div className={styles.row}>
+                <button className={styles.btn} type="button" onClick={() => void handleCreateAiSession()} disabled={busy || sessionBusy || Boolean(activeAiSession)}>
+                  Create Session
+                </button>
+                <button
+                  className={styles.btn}
+                  type="button"
+                  onClick={() => void handleInitAiSession()}
+                  disabled={
+                    busy ||
+                    sessionBusy ||
+                    !activeAiSession ||
+                    !hostAuthSession?.bindToken ||
+                    activeAiSessionSnapshot?.transport?.phase === 'ready'
+                  }
+                >
+                  Init Codex
+                </button>
+                <button className={styles.btn} type="button" onClick={() => void handleCheckpointAiSession()} disabled={busy || sessionBusy || !activeAiSession}>
+                  Checkpoint
+                </button>
+                <button className={styles.btnDanger} type="button" onClick={() => void handleRevokeAiSession()} disabled={busy || sessionBusy || !activeAiSession}>
+                  Revoke Session
+                </button>
+              </div>
+
+              <CodexPanel
+                transport={activeCodexPanel?.transport ?? activeAiSessionSnapshot?.transport ?? null}
+                initTranscript={activeCodexPanel?.initTranscript ?? []}
+                turnTranscript={activeCodexPanel?.turnTranscript ?? []}
+                loading={codexLogsBusy}
+              />
+            </div>
+          ) : null}
         </section>
 
         <section className={styles.panel}>

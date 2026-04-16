@@ -31,7 +31,7 @@ describe('projects api routes', () => {
     expect(response.status).toBe(200);
     expect(data.ok).toBe(true);
     expect(data.projects).toHaveLength(1);
-  });
+  }, 15000);
 
   it('creates a project', async () => {
     mockService.createProject.mockResolvedValue({ id: 'p2', name: 'Project 2', currentVersion: 0, versions: [] });

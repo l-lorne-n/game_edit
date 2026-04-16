@@ -1,6 +1,12 @@
 import { NextResponse } from 'next/server';
 
-import { modifyPackageFromInstruction } from '@/lib/ai/generate-package';
+import {
+  AiSessionMessageNotReadyError,
+  AiSessionTransportNotImplementedError,
+  AiSessionTransportNotInitializedError,
+} from '@/lib/ai-sessions/service';
+import { runCodexPackageTask } from '@/lib/ai/codex-package-task';
+import { computePackageRouteDecision } from '@/lib/ai/package-route-decision';
 import { parseGeneratedGamePackage } from '@/lib/package/contracts';
 import { createProjectService } from '@/lib/projects/service';
 
@@ -14,6 +20,7 @@ export async function POST(request: Request) {
       lastKnownGoodPackage?: unknown;
       targetId?: string;
       projectId?: string;
+      aiSessionId?: string;
     };
 
     const instruction = body.instruction?.trim();
@@ -36,23 +43,37 @@ export async function POST(request: Request) {
     const parsedLastGood = body.lastKnownGoodPackage
       ? parseGeneratedGamePackage(body.lastKnownGoodPackage)
       : null;
-
-    const result = await modifyPackageFromInstruction({
-      instruction,
-      currentPackage: parsedCurrent.pkg,
-      lastKnownGood: parsedLastGood?.ok ? parsedLastGood.pkg : undefined,
+    const serverRouteDecision = computePackageRouteDecision({
+      mode: 'modify',
+      requestText: instruction,
+      targetId: body.targetId ?? '__current__',
+      targetPackage: parsedCurrent.pkg,
     });
+
+    const result = await runCodexPackageTask({
+        mode: 'modify',
+        projectId: body.projectId,
+        aiSessionId: body.aiSessionId,
+        targetId: body.targetId ?? null,
+        instruction,
+        currentPackage: parsedCurrent.pkg,
+      lastKnownGoodPackage: parsedLastGood?.ok ? parsedLastGood.pkg : undefined,
+        routeMode: serverRouteDecision.routeMode,
+        routeReason: serverRouteDecision.primaryReasonCode,
+        allowedPaths: serverRouteDecision.allowedPaths,
+        checkpointOnSuccess: true,
+      });
 
     let persistedProject = null;
     let persistenceWarning: string | null = null;
-    if (body.projectId) {
+    if (body.projectId && !result.requiresReplan) {
       try {
         persistedProject = await projectService.saveGeneratedPackage({
           projectId: body.projectId,
-          pkg: result.pkg,
+          pkg: result.solveResult.pkg,
           source: 'modify',
           parentVersion: (await projectService.getProject(body.projectId))?.currentVersion ?? null,
-          evaluator: result.staticEvaluation,
+          evaluator: result.solveResult.staticEvaluation,
         });
       } catch (error) {
         persistenceWarning = error instanceof Error ? error.message : 'Project persistence is unavailable.';
@@ -63,20 +84,29 @@ export async function POST(request: Request) {
       ok: true,
       instruction,
       targetId: body.targetId ?? null,
-      package: result.pkg,
-      manifest: result.manifest,
-      staticEvaluation: result.staticEvaluation,
-      repaired: result.repaired,
-      fallbackUsed: result.fallbackUsed,
-      source: result.source,
-      statusMessage: result.statusMessage,
-      provider: result.provider,
-      model: result.model,
-      attempts: result.attempts,
+      package: result.solveResult.pkg,
+      manifest: result.solveResult.manifest,
+      staticEvaluation: result.solveResult.staticEvaluation,
+      repaired: result.solveResult.repaired,
+      fallbackUsed: result.solveResult.fallbackUsed,
+      source: result.solveResult.source,
+      statusMessage: result.solveResult.statusMessage,
+      provider: result.solveResult.provider,
+      model: result.solveResult.model,
+      attempts: result.solveResult.attempts,
+      requiresReplan: result.requiresReplan,
+      executionEngine: result.executionTraceMeta,
+      serverRouteDecision,
       project: persistedProject,
       persistenceWarning,
     });
   } catch (error) {
+    if (error instanceof AiSessionTransportNotInitializedError || error instanceof AiSessionMessageNotReadyError) {
+      return NextResponse.json({ ok: false, error: error.message, code: error.code }, { status: 409 });
+    }
+    if (error instanceof AiSessionTransportNotImplementedError) {
+      return NextResponse.json({ ok: false, error: error.message, code: error.reason }, { status: 502 });
+    }
     return NextResponse.json(
       {
         ok: false,
