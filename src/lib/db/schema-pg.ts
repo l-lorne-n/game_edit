@@ -110,6 +110,8 @@ export const aiSessions = pgTable('ai_sessions', {
     .references(() => projects.id, { onDelete: 'cascade' }),
   ownerId: text('owner_id').notNull(),
   baseVersion: integer('base_version').notNull(),
+  activeWorkspaceVersion: integer('active_workspace_version').notNull().default(1),
+  latestWorkspaceVersion: integer('latest_workspace_version').notNull().default(1),
   status: aiSessionStateEnum('status').notNull().default('provisioning'),
   authMode: aiSessionAuthModeEnum('auth_mode').notNull().default('chatgptAuthTokens'),
   authState: aiSessionAuthStateEnum('auth_state').notNull().default('bootstrap_pending'),

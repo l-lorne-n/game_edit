@@ -99,6 +99,8 @@ describe('runAppServerPackageExecutor', () => {
         id: 'sess-1',
         projectId: 'project-1',
         baseVersion: 3,
+        activeWorkspaceVersion: 1,
+        latestWorkspaceVersion: 1,
         revokedAt: null,
         status: 'ready',
         appServerStatus: 'stopped',
@@ -128,6 +130,8 @@ describe('runAppServerPackageExecutor', () => {
         id: 'sess-1',
         projectId: 'project-1',
         baseVersion: 3,
+        activeWorkspaceVersion: 1,
+        latestWorkspaceVersion: 1,
         revokedAt: null,
         status: 'ready',
         appServerStatus: 'healthy',
@@ -140,6 +144,9 @@ describe('runAppServerPackageExecutor', () => {
         threadId: 'thr-1',
         turnStatus: 'completed',
         agentText: 'done',
+        workspaceVersion: 2,
+        workspaceRoot: '/workspace/home/sessions/sess-1/v2',
+        baseTargetId: 'session:v1',
       }),
       readWorkspacePackage: vi.fn().mockResolvedValue({
         indexHtml: '<html></html>',
@@ -148,6 +155,7 @@ describe('runAppServerPackageExecutor', () => {
         manifestJson: '{"title":"Demo","summary":"Demo","editable":[],"capabilities":[]}',
       }),
       writeWorkspacePackage: vi.fn(),
+      promoteWorkspaceVersion: vi.fn().mockResolvedValue(undefined),
     };
     const projectService = {
       getProject: vi.fn().mockResolvedValue({ id: 'project-1', ownerId: 'owner-1', currentVersion: 3 }),
@@ -168,13 +176,14 @@ describe('runAppServerPackageExecutor', () => {
         manifestJson: '{"title":"Demo","summary":"Demo","editable":[],"capabilities":[]}',
       },
       routeMode: 'patch',
-      routeReason: 'EDITABLE_SCOPE_MATCH',
+      routeReason: 'MODIFY_REQUEST',
       allowedPaths: ['gameJs'],
     });
 
     expect(result.actualEngine).toBe('codex-app-server');
     expect(result.fallbackReason).toBeNull();
-    expect(aiSessionService.readWorkspacePackage).toHaveBeenCalledWith('sess-1');
+    expect(aiSessionService.readWorkspacePackage).toHaveBeenCalledWith('sess-1', 2);
+    expect(aiSessionService.promoteWorkspaceVersion).toHaveBeenCalledWith('sess-1', 2);
   });
 
   it('recovers package files from agent text when workspace files remain empty', async () => {
@@ -189,6 +198,8 @@ describe('runAppServerPackageExecutor', () => {
         id: 'sess-1',
         projectId: 'project-1',
         baseVersion: 3,
+        activeWorkspaceVersion: 1,
+        latestWorkspaceVersion: 1,
         revokedAt: null,
         status: 'ready',
         appServerStatus: 'healthy',
@@ -201,6 +212,9 @@ describe('runAppServerPackageExecutor', () => {
         threadId: 'thr-1',
         turnStatus: 'completed',
         agentText: JSON.stringify(recoveredPkg),
+        workspaceVersion: 2,
+        workspaceRoot: '/workspace/home/sessions/sess-1/v2',
+        baseTargetId: 'session:v1',
       }),
       readWorkspacePackage: vi.fn().mockResolvedValue({
         indexHtml: '',
@@ -209,6 +223,7 @@ describe('runAppServerPackageExecutor', () => {
         manifestJson: '',
       }),
       writeWorkspacePackage: vi.fn().mockResolvedValue(undefined),
+      promoteWorkspaceVersion: vi.fn().mockResolvedValue(undefined),
     };
     const projectService = {
       getProject: vi.fn().mockResolvedValue({ id: 'project-1', ownerId: 'owner-1', currentVersion: 3 }),
@@ -224,7 +239,8 @@ describe('runAppServerPackageExecutor', () => {
       prompt: 'make game',
     });
 
-    expect(aiSessionService.writeWorkspacePackage).toHaveBeenCalledWith('sess-1', recoveredPkg);
+    expect(aiSessionService.writeWorkspacePackage).toHaveBeenCalledWith('sess-1', recoveredPkg, 2);
+    expect(aiSessionService.promoteWorkspaceVersion).toHaveBeenCalledWith('sess-1', 2);
     expect(result.solveResult.pkg.indexHtml).toBe('<main>hi</main>');
   });
 });

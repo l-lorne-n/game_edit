@@ -1,4 +1,4 @@
-import { getAiSessionWorkspaceRoot } from '@/lib/ai-sessions/workspace';
+import { getAiSessionVersionRoot, getAiSessionWorkspaceRoot } from '@/lib/ai-sessions/workspace';
 import type { HostTokenBootstrapResponse } from '@/lib/host-tokens/types';
 import type { SandboxCodexAppServerConfig, SandboxProvider } from '@/lib/sandbox/types';
 
@@ -15,8 +15,8 @@ export type CodexAppServerStopConfig = {
   timeoutMs: number;
 };
 
-export function getAiSessionWorkspaceAbsoluteRoot(sessionId: string): string {
-  return `/workspace/home/${getAiSessionWorkspaceRoot(sessionId)}`;
+export function getAiSessionWorkspaceAbsoluteRoot(sessionId: string, workspaceVersion: number): string {
+  return `/workspace/home/${getAiSessionVersionRoot(sessionId, workspaceVersion)}`;
 }
 
 function toJsonl(messages: JsonRpcMessage[]): string {
@@ -280,7 +280,7 @@ export function buildCodexAppServerRunnerFiles(
 }
 
 export function buildCodexRunnerExecCommand(sessionId: string): string {
-  const root = getAiSessionWorkspaceAbsoluteRoot(sessionId);
+  const root = `/workspace/home/${getAiSessionWorkspaceRoot(sessionId)}`;
   return `cd ${JSON.stringify(root)} && node .codex-runner.mjs ./.codex-runner-config.json`;
 }
 
@@ -338,13 +338,13 @@ function getCodexSandboxMode(): string {
   return process.env.CODEX_APP_SERVER_SANDBOX ?? 'danger-full-access';
 }
 
-export function createThreadStartMessage(sessionId: string): JsonRpcMessage {
+export function createThreadStartMessage(sessionId: string, workspaceVersion: number): JsonRpcMessage {
   return {
     method: 'thread/start',
     id: 2,
     params: {
       model: 'gpt-5.4',
-      cwd: getAiSessionWorkspaceAbsoluteRoot(sessionId),
+      cwd: getAiSessionWorkspaceAbsoluteRoot(sessionId, workspaceVersion),
       approvalPolicy: 'never',
       sandbox: getCodexSandboxMode(),
       serviceName: 'game_edit',
@@ -362,13 +362,13 @@ export function createThreadResumeMessage(threadId: string): JsonRpcMessage {
   };
 }
 
-export function createTurnStartMessage(sessionId: string, threadId: string, prompt: string): JsonRpcMessage {
+export function createTurnStartMessage(threadId: string, prompt: string, cwd: string): JsonRpcMessage {
   return {
     method: 'turn/start',
     id: 3,
     params: {
       threadId,
-      cwd: getAiSessionWorkspaceAbsoluteRoot(sessionId),
+      cwd,
       approvalPolicy: 'never',
       sandbox: getCodexSandboxMode(),
       input: [{ type: 'text', text: prompt }],

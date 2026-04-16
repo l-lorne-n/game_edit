@@ -19,7 +19,6 @@ describe('package contracts', () => {
     pkg.manifestJson = stringifyManifest({
       title: 'Bad Capability',
       summary: 'contains invalid capability',
-      editable: [],
       capabilities: ['audio', 'network' as never],
     });
 
@@ -29,6 +28,22 @@ describe('package contracts', () => {
       return;
     }
     expect(parsed.code).toBe('MANIFEST_SCHEMA_INVALID');
+  });
+
+  it('accepts manifests that omit editable metadata', () => {
+    const pkg = createTemplatePackage('No Editable');
+    pkg.manifestJson = JSON.stringify({
+      title: 'No Editable',
+      summary: 'editable metadata removed',
+      capabilities: [],
+    });
+
+    const parsed = parseGeneratedGamePackage(pkg);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+    expect(parsed.manifest.editable).toBeUndefined();
   });
 
   it('rejects missing required package fields', () => {

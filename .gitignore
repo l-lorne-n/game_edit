@@ -11,3 +11,6 @@ test-results/
 .env.development.local
 .env.test.local
 .env.production.local
+
+.sisyphus/
+.sample-generate-2.json

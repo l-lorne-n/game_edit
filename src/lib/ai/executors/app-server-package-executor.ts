@@ -59,12 +59,12 @@ export async function runAppServerPackageExecutor(input: PackageExecutorInput): 
     allowedPaths: input.allowedPaths,
   });
 
-  const pkg = await aiSessionService.readWorkspacePackage(session.id);
+  const pkg = await aiSessionService.readWorkspacePackage(session.id, messageResult.workspaceVersion);
   let parsed = parseGeneratedGamePackage(pkg);
   if (!parsed.ok && messageResult.agentText.trim()) {
     const recovered = recoverPackageFromAgentText(messageResult.agentText);
     if (recovered.ok) {
-      await aiSessionService.writeWorkspacePackage(session.id, recovered.pkg);
+      await aiSessionService.writeWorkspacePackage(session.id, recovered.pkg, messageResult.workspaceVersion);
       parsed = recovered;
     }
   }
@@ -76,6 +76,7 @@ export async function runAppServerPackageExecutor(input: PackageExecutorInput): 
   }
 
   const finalPkg = parsed.pkg;
+  await aiSessionService.promoteWorkspaceVersion(session.id, messageResult.workspaceVersion);
 
   return {
     solveResult: {

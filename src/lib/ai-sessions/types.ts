@@ -75,6 +75,8 @@ export type AiSessionRecord = {
   projectId: string;
   ownerId: string;
   baseVersion: number;
+  activeWorkspaceVersion: number;
+  latestWorkspaceVersion: number;
   status: AiSessionState;
   authMode: AiSessionAuthMode;
   authState: AiSessionAuthState;
@@ -130,11 +132,14 @@ export type CreateAiSessionInput = {
 };
 
 export type UpdateAiSessionInput = Partial<
-  Pick<
-    AiSessionRecord,
-    | 'status'
-    | 'authState'
-    | 'boxId'
+    Pick<
+      AiSessionRecord,
+      | 'status'
+      | 'baseVersion'
+      | 'activeWorkspaceVersion'
+      | 'latestWorkspaceVersion'
+      | 'authState'
+      | 'boxId'
     | 'codexHomeKey'
     | 'boxStatus'
     | 'appServerStatus'

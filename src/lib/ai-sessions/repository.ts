@@ -69,6 +69,8 @@ async function ensureAiSessionSchema(): Promise<void> {
           project_id text not null references projects(id) on delete cascade,
           owner_id text not null,
           base_version integer not null,
+          active_workspace_version integer not null default 1,
+          latest_workspace_version integer not null default 1,
           status ai_session_state not null default 'provisioning',
           auth_mode ai_session_auth_mode not null default 'chatgptAuthTokens',
           auth_state ai_session_auth_state not null default 'bootstrap_pending',
@@ -95,6 +97,8 @@ async function ensureAiSessionSchema(): Promise<void> {
           updated_at timestamptz not null default now()
         )
       `);
+      await db.execute(sql`alter table ai_sessions add column if not exists active_workspace_version integer not null default 1`);
+      await db.execute(sql`alter table ai_sessions add column if not exists latest_workspace_version integer not null default 1`);
       await db.execute(sql`alter table ai_sessions add column if not exists codex_home_key text`);
       await db.execute(sql`alter table ai_sessions add column if not exists daemon_status text not null default 'stopped'`);
       await db.execute(sql`alter table ai_sessions add column if not exists thread_materialized_at timestamptz`);
@@ -138,6 +142,8 @@ function toSessionRecord(input: typeof aiSessions.$inferSelect): AiSessionRecord
     projectId: input.projectId,
     ownerId: input.ownerId,
     baseVersion: input.baseVersion,
+    activeWorkspaceVersion: input.activeWorkspaceVersion,
+    latestWorkspaceVersion: input.latestWorkspaceVersion,
     status: input.status,
     authMode: input.authMode,
     authState: input.authState,
@@ -196,9 +202,11 @@ export class DrizzleAiSessionRepository implements AiSessionRepository {
     await db.insert(aiSessions).values({
       id: input.id,
       projectId: input.projectId,
-      ownerId: input.ownerId,
-      baseVersion: input.baseVersion,
-      status: input.status,
+        ownerId: input.ownerId,
+        baseVersion: input.baseVersion,
+        activeWorkspaceVersion: input.activeWorkspaceVersion,
+        latestWorkspaceVersion: input.latestWorkspaceVersion,
+        status: input.status,
         authMode: input.authMode,
         authState: input.authState,
         boxId: input.boxId,
@@ -252,6 +260,9 @@ export class DrizzleAiSessionRepository implements AiSessionRepository {
       .update(aiSessions)
       .set({
         ...('status' in input ? { status: input.status } : {}),
+        ...('baseVersion' in input ? { baseVersion: input.baseVersion } : {}),
+        ...('activeWorkspaceVersion' in input ? { activeWorkspaceVersion: input.activeWorkspaceVersion ?? 1 } : {}),
+        ...('latestWorkspaceVersion' in input ? { latestWorkspaceVersion: input.latestWorkspaceVersion ?? 1 } : {}),
         ...('authState' in input ? { authState: input.authState } : {}),
         ...('boxId' in input ? { boxId: input.boxId ?? null } : {}),
         ...('codexHomeKey' in input ? { codexHomeKey: input.codexHomeKey ?? null } : {}),

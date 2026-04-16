@@ -107,6 +107,8 @@ describe('ai session service', () => {
 
     expect(session.projectId).toBe('project-1');
     expect(session.baseVersion).toBe(3);
+    expect(session.activeWorkspaceVersion).toBe(1);
+    expect(session.latestWorkspaceVersion).toBe(1);
     expect(session.status).toBe('provisioning');
     expect(session.authMode).toBe('chatgptAuthTokens');
     expect(session.authState).toBe('bootstrap_pending');

@@ -58,7 +58,7 @@ describe('runCodexPackageTask', () => {
     expect(generatePackageFromPromptMock).toHaveBeenCalledWith('make game', undefined);
   });
 
-  it('maps modify patch flow to modify executor', async () => {
+  it('maps modify flow to the same plan_then_execute strategy as create', async () => {
     const pkg = createTemplatePackage('demo');
     modifyPackageFromInstructionMock.mockResolvedValue({
       pkg,
@@ -77,29 +77,42 @@ describe('runCodexPackageTask', () => {
       mode: 'modify',
       instruction: 'change color',
       currentPackage: pkg,
-      routeMode: 'patch',
+      routeMode: 'design',
+      routeReason: 'MODIFY_REQUEST',
     });
 
-    expect(result.envelope.strategy).toBe('patch_execute');
+    expect(result.envelope.strategy).toBe('plan_then_execute');
     expect(result.requiresReplan).toBe(false);
     expect(modifyPackageFromInstructionMock).toHaveBeenCalled();
   });
 
-  it('marks modify design flow as replan required', async () => {
+  it('keeps modify on the unified execution path even with routeMode=design', async () => {
     const pkg = createTemplatePackage('demo');
+    modifyPackageFromInstructionMock.mockResolvedValue({
+      pkg,
+      manifest: JSON.parse(pkg.manifestJson),
+      staticEvaluation: { ok: true, code: 'OK', summary: 'ok', errors: [], warnings: [], runtimeHints: [] },
+      repaired: false,
+      fallbackUsed: false,
+      source: 'model',
+      statusMessage: 'done',
+      provider: 'test',
+      model: 'test-model',
+      attempts: [],
+    });
 
     const result = await runCodexPackageTask({
       mode: 'modify',
       instruction: 'add totally new mechanic',
       currentPackage: pkg,
       routeMode: 'design',
-      routeReason: 'EDITABLE_SCOPE_MISS',
+      routeReason: 'MODIFY_REQUEST',
     });
 
-    expect(result.envelope.strategy).toBe('replan_required');
-    expect(result.requiresReplan).toBe(true);
-    expect(modifyPackageFromInstructionMock).not.toHaveBeenCalled();
-    expect(result.solveResult.staticEvaluation.code).toBe('TEST_FAILED');
+    expect(result.envelope.strategy).toBe('plan_then_execute');
+    expect(result.requiresReplan).toBe(false);
+    expect(modifyPackageFromInstructionMock).toHaveBeenCalled();
+    expect(result.solveResult.staticEvaluation.code).toBe('OK');
   });
 
   it('maps debug to repair_execute', async () => {

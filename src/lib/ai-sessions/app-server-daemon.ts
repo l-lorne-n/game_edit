@@ -1,5 +1,5 @@
 import type { SandboxCodexAppServerConfig, SandboxProvider } from '@/lib/sandbox/types';
-import { getAiSessionWorkspaceAbsoluteRoot } from '@/lib/ai-sessions/app-server-stdio';
+import { getAiSessionWorkspaceRoot } from '@/lib/ai-sessions/workspace';
 
 export type JsonRpcMessage = Record<string, unknown>;
 
@@ -30,7 +30,7 @@ type CodexAppServerDaemonResponse = {
 };
 
 function getDaemonRoot(sessionId: string): string {
-  return getAiSessionWorkspaceAbsoluteRoot(sessionId);
+  return `/workspace/home/${getAiSessionWorkspaceRoot(sessionId)}`;
 }
 
 export function getAiSessionDaemonPort(sessionId: string): number {

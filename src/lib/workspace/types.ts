@@ -56,17 +56,12 @@ export type WorkspaceState = {
   limits: WorkspaceLimits;
 };
 
-export type RouteAgent = 'architect' | 'worker' | 'fixer';
+export type RouteAgent = 'architect' | 'fixer';
 
 export type RouteReasonCode =
   | 'CREATE_REQUEST'
-  | 'DEBUG_REQUEST'
-  | 'EDITABLE_SCOPE_MATCH'
-  | 'EDITABLE_SCOPE_MISS'
-  | 'NO_EDITABLE_SCOPE_DECLARED'
-  | 'BEHAVIOR_RULE_CHANGE'
-  | 'SYSTEM_MECHANIC_CHANGE'
-  | 'LOW_CONFIDENCE';
+  | 'MODIFY_REQUEST'
+  | 'DEBUG_REQUEST';
 
 export type RouteDecision = {
   agent: RouteAgent;

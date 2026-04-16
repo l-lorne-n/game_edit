@@ -24,16 +24,17 @@ These four files are the real deliverable. They must all exist and be non-empty 
 ## Manifest contract
 - title: string, 1-80 chars
 - summary: string, 1-280 chars
-- editable: string[] (NOT boolean)
 - capabilities: array with at most 3 items, each item must be one of: ${PACKAGE_CAPABILITY_VALUES.join(', ')}
 - notes: optional string, max 600 chars
+
+Legacy compatibility note:
+- editable: string[] may appear in older manifests, but it is optional and no longer used to decide whether a modify request is allowed.
 
 ### Valid manifest example
 ${JSON.stringify(
     {
       title: 'Snake',
       summary: 'A browser snake game with keyboard controls.',
-      editable: ['snake speed', 'board size', 'color theme'],
       capabilities: [],
       notes: 'No external dependencies.',
     },
@@ -58,11 +59,11 @@ export function buildWorkspaceContractJson(): string {
   return JSON.stringify(
     {
       requiredFiles: ['index.html', 'game.js', 'style.css', 'manifest.json'],
-      manifest: {
-        title: { type: 'string', min: 1, max: 80 },
-        summary: { type: 'string', min: 1, max: 280 },
-        editable: { type: 'string[]', minItems: 0, maxItems: 32 },
-        capabilities: {
+        manifest: {
+          title: { type: 'string', min: 1, max: 80 },
+          summary: { type: 'string', min: 1, max: 280 },
+          editable: { type: 'string[]', optional: true, minItems: 0, maxItems: 32, legacyOnly: true },
+          capabilities: {
           type: 'enum[]',
           allowed: PACKAGE_CAPABILITY_VALUES,
           maxItems: 3,

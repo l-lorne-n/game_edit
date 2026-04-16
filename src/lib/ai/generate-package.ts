@@ -208,7 +208,6 @@ function fallbackResult(input: {
       : {
           title: 'Fallback Package',
           summary: 'Fallback package used because model output was invalid.',
-          editable: [],
           capabilities: [],
         };
   return {

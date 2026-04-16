@@ -7,7 +7,7 @@ export const packageCapabilitySchema = z.enum(PACKAGE_CAPABILITY_VALUES);
 export const packageManifestSchema = z.object({
   title: z.string().min(1).max(80),
   summary: z.string().min(1).max(280),
-  editable: z.array(z.string().min(1).max(80)).max(32).default([]),
+  editable: z.array(z.string().min(1).max(80)).max(32).optional(),
   capabilities: z.array(packageCapabilitySchema).max(3).default([]),
   notes: z.string().max(600).optional(),
 });

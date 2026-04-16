@@ -35,8 +35,13 @@ import {
   findTurnCompletedStatus,
   getAiSessionWorkspaceAbsoluteRoot,
 } from '@/lib/ai-sessions/app-server-stdio';
-import { getAiSessionWorkspaceFilePath, getAiSessionWorkspaceRoot } from '@/lib/ai-sessions/workspace';
-import { filesToGeneratedPackage } from '@/lib/projects/package-files';
+import {
+  getAiSessionVersionTargetId,
+  getAiSessionWorkspaceFilePath,
+  getAiSessionWorkspaceRoot,
+  parseAiSessionVersionTargetId,
+} from '@/lib/ai-sessions/workspace';
+import { filesToGeneratedPackage, versionFromSnapshotId } from '@/lib/projects/package-files';
 import { createWorkspaceContractFiles } from '@/lib/package/workspace-contract';
 import { CANONICAL_PACKAGE_FILE_PATHS, type CanonicalPackageFilePath } from '@/lib/projects/types';
 import { createProjectService } from '@/lib/projects/service';
@@ -108,9 +113,93 @@ function isActiveWriterSession(session: AiSessionRecord, now = Date.now()): bool
   return ACTIVE_WRITER_STATES.has(session.status) && new Date(session.leaseExpiresAt).getTime() > now && !session.revokedAt;
 }
 
+function getActiveWorkspaceVersion(session: AiSessionRecord): number {
+  return session.activeWorkspaceVersion > 0 ? session.activeWorkspaceVersion : 1;
+}
+
+function getLatestWorkspaceVersion(session: AiSessionRecord): number {
+  return session.latestWorkspaceVersion > 0 ? session.latestWorkspaceVersion : 1;
+}
+
 export function createAiSessionService(repository: AiSessionRepository = new DrizzleAiSessionRepository()) {
   const projectService = createProjectService();
   const supervisor = getAiSessionSupervisor();
+
+  async function readProjectPackageVersion(projectId: string, version: number) {
+    const project = await projectService.getProject(projectId);
+    if (!project) {
+      throw new Error(`Project not found: ${projectId}`);
+    }
+
+    const targetVersion = project.versions.find(item => item.version === version);
+    if (!targetVersion) {
+      throw new Error(`Project version not found: ${projectId}@${version}`);
+    }
+
+    return targetVersion.pkg;
+  }
+
+  async function readWorkspacePackageVersion(sessionId: string, workspaceVersion: number) {
+    const sandboxProvider = getSandboxProvider();
+    const files: Partial<Record<CanonicalPackageFilePath, string>> = {};
+    await Promise.all(
+      CANONICAL_PACKAGE_FILE_PATHS.map(async path => {
+        files[path] = await sandboxProvider.readFile(getAiSessionWorkspaceFilePath(sessionId, path, workspaceVersion));
+      }),
+    );
+    return filesToGeneratedPackage(files);
+  }
+
+  async function writeWorkspacePackageVersion(
+    sessionId: string,
+    workspaceVersion: number,
+    pkg: {
+      indexHtml: string;
+      gameJs: string;
+      styleCss: string;
+      manifestJson: string;
+    },
+  ) {
+    const sandboxProvider = getSandboxProvider();
+    await sandboxProvider.writeFiles([
+      { path: getAiSessionWorkspaceFilePath(sessionId, 'index.html', workspaceVersion), content: pkg.indexHtml },
+      { path: getAiSessionWorkspaceFilePath(sessionId, 'game.js', workspaceVersion), content: pkg.gameJs },
+      { path: getAiSessionWorkspaceFilePath(sessionId, 'style.css', workspaceVersion), content: pkg.styleCss },
+      { path: getAiSessionWorkspaceFilePath(sessionId, 'manifest.json', workspaceVersion), content: pkg.manifestJson },
+      ...createWorkspaceContractFiles(`${getAiSessionWorkspaceRoot(sessionId)}/v${workspaceVersion}`),
+    ]);
+  }
+
+  async function resolveWorkspaceBasePackage(session: AiSessionRecord, targetId?: string | null) {
+    if (!targetId || targetId === '__current__') {
+      const workspaceVersion = getActiveWorkspaceVersion(session);
+      return {
+        pkg: await readWorkspacePackageVersion(session.id, workspaceVersion),
+        sourceTargetId: getAiSessionVersionTargetId(workspaceVersion),
+        workspaceVersion,
+      };
+    }
+
+    const sessionWorkspaceVersion = parseAiSessionVersionTargetId(targetId);
+    if (sessionWorkspaceVersion) {
+      return {
+        pkg: await readWorkspacePackageVersion(session.id, sessionWorkspaceVersion),
+        sourceTargetId: getAiSessionVersionTargetId(sessionWorkspaceVersion),
+        workspaceVersion: sessionWorkspaceVersion,
+      };
+    }
+
+    const projectVersion = versionFromSnapshotId(targetId);
+    if (projectVersion) {
+      return {
+        pkg: await readProjectPackageVersion(session.projectId, projectVersion),
+        sourceTargetId: targetId,
+        workspaceVersion: null,
+      };
+    }
+
+    throw new Error(`Unknown modify target: ${targetId}`);
+  }
 
   return {
     async createSession(input: CreateAiSessionInput): Promise<AiSessionRecord> {
@@ -128,6 +217,8 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
         projectId: input.projectId,
         ownerId: input.ownerId,
         baseVersion: input.baseVersion,
+        activeWorkspaceVersion: 1,
+        latestWorkspaceVersion: 1,
         status: 'provisioning',
         authMode: input.authMode ?? 'chatgptAuthTokens',
         authState: 'bootstrap_pending',
@@ -323,20 +414,21 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
 
       const filesToHydrate = await Promise.all(
         CANONICAL_PACKAGE_FILE_PATHS.map(async path => ({
-          path: getAiSessionWorkspaceFilePath(sessionId, path),
+          path: getAiSessionWorkspaceFilePath(sessionId, path, 1),
           content: (await projectService.readProjectFile(session.projectId, session.baseVersion, path)) ?? '',
         })),
       );
       await sandboxProvider.writeFiles([
         ...filesToHydrate,
-        ...createWorkspaceContractFiles(getAiSessionWorkspaceRoot(sessionId)),
+        ...createWorkspaceContractFiles(`${getAiSessionWorkspaceRoot(sessionId)}/v1`),
       ]);
       await repository.appendEvent({
         sessionId,
         type: 'workspace.hydrated',
         payload: {
           baseVersion: session.baseVersion,
-          workspaceRoot: getAiSessionWorkspaceRoot(sessionId),
+          workspaceRoot: `${getAiSessionWorkspaceRoot(sessionId)}/v1`,
+          workspaceVersion: 1,
         },
       });
 
@@ -432,7 +524,7 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
       const messages = [
         ...createInitializeMessages(),
         createExternalAuthLoginMessage(hostTokens),
-        createThreadStartMessage(sessionId),
+        createThreadStartMessage(sessionId, getActiveWorkspaceVersion(session)),
       ];
 
       for (const message of messages) {
@@ -443,7 +535,7 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
         sandboxProvider,
         sessionId,
         appServerConfig,
-        getAiSessionWorkspaceAbsoluteRoot(sessionId),
+        getAiSessionWorkspaceAbsoluteRoot(sessionId, getActiveWorkspaceVersion(session)),
         hostTokenRuntime,
       );
       const startResult = await callCodexAppServerDaemon(sandboxProvider, sessionId, {
@@ -583,15 +675,8 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
       }
 
       await repository.updateSession(sessionId, { status: 'checkpointing' });
-      const sandboxProvider = getSandboxProvider();
-      const files: Partial<Record<CanonicalPackageFilePath, string>> = {};
-      await Promise.all(
-        CANONICAL_PACKAGE_FILE_PATHS.map(async path => {
-          files[path] = await sandboxProvider.readFile(getAiSessionWorkspaceFilePath(sessionId, path));
-        }),
-      );
-
-      const pkg = filesToGeneratedPackage(files);
+      const workspaceVersion = getActiveWorkspaceVersion(session);
+      const pkg = await readWorkspacePackageVersion(sessionId, workspaceVersion);
       const persistedProject = await projectService.saveGeneratedPackage({
         projectId: session.projectId,
         pkg,
@@ -611,6 +696,7 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
       });
 
       const updatedSession = await repository.updateSession(sessionId, {
+        baseVersion: persistedProject.currentVersion,
         status: 'ready',
         lastCheckpointId: checkpoint.id,
         lastCheckpointVersion: checkpoint.newVersion,
@@ -618,7 +704,7 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
       await repository.appendEvent({
         sessionId,
         type: 'checkpoint.committed',
-        payload: { idempotencyKey, newVersion: persistedProject.currentVersion },
+        payload: { idempotencyKey, newVersion: persistedProject.currentVersion, workspaceVersion },
       });
 
       return { session: updatedSession, checkpoint, project: persistedProject };
@@ -631,7 +717,17 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
       routeMode?: 'design' | 'patch' | 'repair' | null;
       routeReason?: string | null;
       allowedPaths?: string[];
-    }): Promise<{ acknowledged: true; sessionId: string; acceptedAt: string; threadId: string; turnStatus: string | null; agentText: string }> {
+    }): Promise<{
+      acknowledged: true;
+      sessionId: string;
+      acceptedAt: string;
+      threadId: string;
+      turnStatus: string | null;
+      agentText: string;
+      workspaceVersion: number;
+      workspaceRoot: string;
+      baseTargetId: string | null;
+    }> {
       const session = await repository.getSession(sessionId);
       if (!session) {
         throw new Error(`Unknown AI session ${sessionId}`);
@@ -674,20 +770,48 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
         throw new AiSessionMessageNotReadyError(`AI session ${sessionId} is not ready for message execution.`);
       }
 
+      let executionWorkspaceVersion = getActiveWorkspaceVersion(session);
+      let baseTargetId: string | null = null;
+      if (input.mode !== 'create') {
+        const resolvedBase = await resolveWorkspaceBasePackage(session, input.targetId ?? '__current__');
+        executionWorkspaceVersion = getLatestWorkspaceVersion(session) + 1;
+        await writeWorkspacePackageVersion(session.id, executionWorkspaceVersion, resolvedBase.pkg);
+        baseTargetId = resolvedBase.sourceTargetId;
+        await repository.appendEvent({
+          sessionId,
+          type: 'workspace.version_staged',
+          payload: {
+            mode: input.mode,
+            baseTargetId,
+            stagedWorkspaceVersion: executionWorkspaceVersion,
+          },
+        });
+      }
+
+      const workspaceRoot = getAiSessionWorkspaceAbsoluteRoot(sessionId, executionWorkspaceVersion);
+
       await repository.appendEvent({
         sessionId,
         type: 'message.requested',
         payload: {
           mode: input.mode,
           targetId: input.targetId ?? null,
+          baseTargetId,
           routeMode: input.routeMode ?? null,
           routeReason: input.routeReason ?? null,
           allowedPaths: input.allowedPaths ?? [],
+          workspaceVersion: executionWorkspaceVersion,
+          workspaceRoot,
         },
       });
       await repository.updateSession(sessionId, { status: 'busy' });
       startAiSessionTransportTurn(sessionId);
-      appendAiSessionTransportLog(sessionId, 'turn', 'system', `Starting ${input.mode} turn.`);
+      appendAiSessionTransportLog(
+        sessionId,
+        'turn',
+        'system',
+        `Starting ${input.mode} turn in workspace v${executionWorkspaceVersion}.`,
+      );
 
       const sandboxProvider = getSandboxProvider();
       const daemonHealth = await getCodexAppServerDaemonHealth(sandboxProvider, sessionId);
@@ -756,10 +880,22 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
         sandboxProvider,
         sessionId,
         appServerConfig,
-        getAiSessionWorkspaceAbsoluteRoot(sessionId),
+        workspaceRoot,
         hostTokenRuntime,
       );
-      const messages = [createTurnStartMessage(sessionId, threadId, input.requestText)];
+      const messages = [createTurnStartMessage(threadId, input.requestText, workspaceRoot)];
+
+      await repository.appendEvent({
+        sessionId,
+        type: 'message.dispatched_to_daemon',
+        payload: {
+          mode: input.mode,
+          threadId,
+          workspaceVersion: executionWorkspaceVersion,
+          workspaceRoot,
+          baseTargetId,
+        },
+      });
 
       for (const message of messages) {
         appendAiSessionTransportLog(sessionId, 'turn', 'outbound', message);
@@ -828,12 +964,14 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
       finishAiSessionTransportTurn(sessionId);
       await repository.appendEvent({
         sessionId,
-        type: 'message.completed',
+        type: 'message.turn_completed',
         payload: {
           threadId,
           turnStatus,
           agentText,
-          workspaceRoot: getAiSessionWorkspaceAbsoluteRoot(sessionId),
+          workspaceVersion: executionWorkspaceVersion,
+          workspaceRoot,
+          baseTargetId,
         },
       });
 
@@ -844,18 +982,51 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
         threadId,
         turnStatus,
         agentText,
+        workspaceVersion: executionWorkspaceVersion,
+        workspaceRoot,
+        baseTargetId,
       };
     },
 
-    async readWorkspacePackage(sessionId: string) {
-      const sandboxProvider = getSandboxProvider();
-      const files: Partial<Record<CanonicalPackageFilePath, string>> = {};
-      await Promise.all(
-        CANONICAL_PACKAGE_FILE_PATHS.map(async path => {
-          files[path] = await sandboxProvider.readFile(getAiSessionWorkspaceFilePath(sessionId, path));
-        }),
-      );
-      return filesToGeneratedPackage(files);
+    async promoteWorkspaceVersion(sessionId: string, workspaceVersion: number) {
+      const session = await repository.getSession(sessionId);
+      if (!session) {
+        throw new Error(`Unknown AI session ${sessionId}`);
+      }
+
+      const updated = await repository.updateSession(sessionId, {
+        activeWorkspaceVersion: workspaceVersion,
+        latestWorkspaceVersion: Math.max(workspaceVersion, getLatestWorkspaceVersion(session)),
+      });
+      await repository.appendEvent({
+        sessionId,
+        type: 'workspace.promoted',
+        payload: {
+          workspaceVersion,
+          workspaceTargetId: getAiSessionVersionTargetId(workspaceVersion),
+          workspaceRoot: getAiSessionWorkspaceAbsoluteRoot(sessionId, workspaceVersion),
+        },
+      });
+      return updated;
+    },
+
+    async readWorkspacePackage(sessionId: string, workspaceVersion?: number) {
+      const session = await repository.getSession(sessionId);
+      if (!session) {
+        throw new Error(`Unknown AI session ${sessionId}`);
+      }
+
+      const resolvedWorkspaceVersion = workspaceVersion ?? getActiveWorkspaceVersion(session);
+      const pkg = await readWorkspacePackageVersion(sessionId, resolvedWorkspaceVersion);
+      await repository.appendEvent({
+        sessionId,
+        type: 'workspace.readback',
+        payload: {
+          workspaceVersion: resolvedWorkspaceVersion,
+          workspaceTargetId: getAiSessionVersionTargetId(resolvedWorkspaceVersion),
+        },
+      });
+      return pkg;
     },
 
     async writeWorkspacePackage(sessionId: string, pkg: {
@@ -863,18 +1034,20 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
       gameJs: string;
       styleCss: string;
       manifestJson: string;
-    }) {
-      const sandboxProvider = getSandboxProvider();
-      await sandboxProvider.writeFiles([
-        { path: getAiSessionWorkspaceFilePath(sessionId, 'index.html'), content: pkg.indexHtml },
-        { path: getAiSessionWorkspaceFilePath(sessionId, 'game.js'), content: pkg.gameJs },
-        { path: getAiSessionWorkspaceFilePath(sessionId, 'style.css'), content: pkg.styleCss },
-        { path: getAiSessionWorkspaceFilePath(sessionId, 'manifest.json'), content: pkg.manifestJson },
-      ]);
+    }, workspaceVersion?: number) {
+      const session = await repository.getSession(sessionId);
+      if (!session) {
+        throw new Error(`Unknown AI session ${sessionId}`);
+      }
+
+      const resolvedWorkspaceVersion = workspaceVersion ?? getActiveWorkspaceVersion(session);
+      await writeWorkspacePackageVersion(sessionId, resolvedWorkspaceVersion, pkg);
       await repository.appendEvent({
         sessionId,
         type: 'workspace.package_written',
         payload: {
+          workspaceVersion: resolvedWorkspaceVersion,
+          workspaceTargetId: getAiSessionVersionTargetId(resolvedWorkspaceVersion),
           sizes: {
             indexHtml: pkg.indexHtml.length,
             gameJs: pkg.gameJs.length,

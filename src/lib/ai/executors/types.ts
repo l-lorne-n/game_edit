@@ -1,7 +1,7 @@
 import type { PackageSolveResult } from '@/lib/ai/generate-package';
 import type { GeneratedGamePackage } from '@/lib/package/contracts';
 
-export type CodexExecutionStrategy = 'plan_then_execute' | 'patch_execute' | 'repair_execute' | 'replan_required';
+export type CodexExecutionStrategy = 'plan_then_execute' | 'repair_execute';
 export type CodexExecutionEngine = 'legacy-model' | 'codex-app-server';
 
 export type PackageExecutorInput = {

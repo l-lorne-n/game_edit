@@ -13,12 +13,14 @@ import type { AiSessionRecord } from '@/lib/ai-sessions/types';
 
 function createSessionRecord(overrides: Partial<AiSessionRecord> = {}): AiSessionRecord {
   const now = new Date().toISOString();
-  return {
-    id: 'sess-1',
-    projectId: 'project-1',
-    ownerId: 'owner-1',
-    baseVersion: 1,
-    status: 'ready',
+    return {
+      id: 'sess-1',
+      projectId: 'project-1',
+      ownerId: 'owner-1',
+      baseVersion: 1,
+      activeWorkspaceVersion: 1,
+      latestWorkspaceVersion: 1,
+      status: 'ready',
     authMode: 'chatgptAuthTokens',
     authState: 'ready',
     boxId: 'box-1',

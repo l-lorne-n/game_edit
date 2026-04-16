@@ -12,7 +12,6 @@ Hard constraints:
 3) manifestJson must itself be valid JSON string with keys:
    - title (string)
    - summary (string)
-   - editable (string[])
    - capabilities (array of: audio | fullscreen | pointerLock)
    - notes (optional string)
 4) Do not use external scripts or network requests.

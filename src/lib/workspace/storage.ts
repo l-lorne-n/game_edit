@@ -136,6 +136,10 @@ export function toGameProject(project: HydratedProjectRecord, cachedProject?: Ga
   const snapshots = project.versions.map(version => toSnapshot(project, version, cachedProject));
   const currentSnapshotId = project.currentVersion > 0 ? snapshotIdFromVersion(project.currentVersion) : '';
   const currentVersion = project.versions.find(version => version.version === project.currentVersion) ?? null;
+  const cachedSelectionIsUsable =
+    !!cachedProject?.selectedModifyBaseId &&
+    (cachedProject.selectedModifyBaseId === '__current__' ||
+      snapshots.some(snapshot => snapshot.id === cachedProject.selectedModifyBaseId));
   const defaultSystemMessage = makeChatMessage({
     role: 'system',
     mode: 'system',
@@ -149,8 +153,9 @@ export function toGameProject(project: HydratedProjectRecord, cachedProject?: Ga
     updatedAt: project.updatedAt,
     persistenceMode: 'server',
     messages: cachedProject?.messages?.length ? cachedProject.messages : [defaultSystemMessage],
-    currentPackage: currentVersion?.pkg ?? null,
-    currentEvaluator: currentVersion?.evaluator ?? cachedProject?.currentEvaluator ?? null,
+    currentPackage: cachedSelectionIsUsable && cachedProject?.currentPackage ? cachedProject.currentPackage : currentVersion?.pkg ?? null,
+    currentEvaluator:
+      cachedSelectionIsUsable && cachedProject?.currentEvaluator ? cachedProject.currentEvaluator : currentVersion?.evaluator ?? null,
     snapshots,
     selectedSnapshotId:
       cachedProject?.selectedSnapshotId && snapshots.some(snapshot => snapshot.id === cachedProject.selectedSnapshotId)
@@ -271,7 +276,6 @@ function migrateLegacyArchives(): WorkspaceState | null {
         {
           title,
           summary: 'Imported from legacy dodge-survival archive. This package is a placeholder scaffold.',
-          editable: ['title', 'summary', 'game behavior'],
           capabilities: [],
           notes: `Legacy DSL payload attached in message history (entry ${index + 1}).`,
         },

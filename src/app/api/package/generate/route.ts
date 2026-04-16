@@ -45,12 +45,11 @@ export async function POST(request: Request) {
         routeMode: serverRouteDecision.routeMode,
         routeReason: serverRouteDecision.primaryReasonCode,
         allowedPaths: serverRouteDecision.allowedPaths,
-        checkpointOnSuccess: true,
       });
 
     let persistedProject = null;
     let persistenceWarning: string | null = null;
-    if (body.projectId) {
+    if (body.projectId && !body.aiSessionId) {
       try {
         persistedProject = await projectService.saveGeneratedPackage({
           projectId: body.projectId,

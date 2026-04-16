@@ -53,13 +53,7 @@ export default function RequestWorkbench({
               {routeDecision
                 ? JSON.stringify(
                     {
-                      agent: routeDecision.agent,
-                      routeMode: routeDecision.routeMode,
-                      confidence: routeDecision.confidence,
                       primaryReasonCode: routeDecision.primaryReasonCode,
-                      secondaryReasonCodes: routeDecision.secondaryReasonCodes,
-                      withinEditableScope: routeDecision.withinEditableScope,
-                      editableScopeSummary: routeDecision.editableScopeSummary,
                       allowedPaths: routeDecision.allowedPaths,
                       allowedChangeTypes: routeDecision.allowedChangeTypes,
                       summary: routeDecision.summary,

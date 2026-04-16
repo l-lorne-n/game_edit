@@ -23,7 +23,6 @@ import type { GamePackageManifest, GeneratedGamePackage } from '@/lib/package/co
 import {
   createProject as createServerProject,
   deleteProject as deleteServerProject,
-  restoreProjectVersion,
   saveProjectPackage,
   updateProjectEvaluation,
 } from '@/lib/projects/client';
@@ -113,7 +112,7 @@ const MODES: Array<{ id: ActionMode; label: string }> = [
 
 function defaultPhases(): PhaseRow[] {
   return [
-    { id: 'generator', label: '架构师/工人/修理工', state: 'idle', detail: '等待任务', elapsedMs: 0 },
+    { id: 'generator', label: '生成器/修复器', state: 'idle', detail: '等待任务', elapsedMs: 0 },
     { id: 'tester', label: '测试者', state: 'idle', detail: '等待生成结果', elapsedMs: 0 },
     { id: 'checker', label: '检查者', state: 'idle', detail: '等待验证结果', elapsedMs: 0 },
   ];
@@ -142,11 +141,9 @@ function snapshotOptionLabel(item: SnapshotDisplayItem): string {
 function labelForAgent(agent: RouteDecision['agent']): string {
   switch (agent) {
     case 'architect':
-      return '架构师';
-    case 'worker':
-      return '工人';
+      return '生成器';
     case 'fixer':
-      return '修理工';
+      return '修复器';
     default:
       return '执行者';
   }
@@ -546,6 +543,11 @@ export default function CodegenAppShell() {
       return;
     }
 
+    if (activeProject.selectedModifyBaseId && activeProject.selectedModifyBaseId !== '__current__') {
+      window.alert('Checkpoint only saves the current AI-session head. If you are previewing an older version, run Modify first to fork a new current head.');
+      return;
+    }
+
     setSessionBusy(true);
     try {
       const result = await checkpointAiSession(activeAiSession.id, `chk-${activeAiSession.id}-${Date.now()}`);
@@ -787,36 +789,25 @@ export default function CodegenAppShell() {
     if (!activeProject || !selectedSnapshot) {
       return;
     }
-    const targetVersion = versionFromSnapshotId(selectedSnapshot.id);
-    if (!targetVersion) {
-      window.alert('Selected snapshot does not map to a server version.');
-      return;
-    }
 
     setBusy(true);
     try {
-      const restoredProject = await restoreProjectVersion(activeProject.id, targetVersion);
-      setWorkspace(prev => {
-        if (!prev) {
-          return prev;
-        }
-        const merged = mergeServerProjectIntoWorkspace(prev, restoredProject);
-        return updateProject(merged, activeProject.id, project => ({
+      if (isServerBackedProject(activeProject)) {
+        mutateActiveProject(project => ({
           ...project,
+          currentPackage: selectedSnapshot.pkg,
+          currentEvaluator: selectedSnapshot.evaluator,
+          selectedModifyBaseId: selectedSnapshot.id,
+          selectedDebugTargetId: selectedSnapshot.id,
           messages: [
             ...project.messages,
             makeChatMessage({
               role: 'system',
               mode: 'system',
-              text: `Restored version ${targetVersion} into a new head version.`,
+              text: `Switched preview to version ${selectedSnapshot.id}. Modify will fork from this version.`,
             }),
           ],
         }));
-      });
-      setRuntimeNonce(prev => prev + 1);
-    } catch (error) {
-      if (isServerBackedProject(activeProject)) {
-        window.alert(error instanceof Error ? error.message : String(error));
       } else {
         mutateActiveProject(project => ({
           ...project,
@@ -833,7 +824,11 @@ export default function CodegenAppShell() {
             }),
           ],
         }));
-        setRuntimeNonce(prev => prev + 1);
+      }
+      setRuntimeNonce(prev => prev + 1);
+    } catch (error) {
+      if (isServerBackedProject(activeProject)) {
+        window.alert(error instanceof Error ? error.message : String(error));
       }
     } finally {
       setBusy(false);
@@ -844,7 +839,7 @@ export default function CodegenAppShell() {
     if (!activeProject || !selectedSnapshot) {
       return;
     }
-    window.alert('Server-backed versions are immutable in this rehearsal. Use restore to fork a new head version instead.');
+    window.alert('Server-backed versions are immutable. Restore only switches preview; it does not delete or fork versions by itself.');
   }
 
   async function handleSubmit(): Promise<void> {
@@ -1129,6 +1124,8 @@ export default function CodegenAppShell() {
           ...next,
           currentPackage: generated,
           currentEvaluator: response.staticEvaluation,
+          selectedModifyBaseId: '__current__',
+          selectedDebugTargetId: '__current__',
           attempts: response.attempts,
           lastMode: mode,
           lastRouteDecision: routeDecision,
@@ -1144,7 +1141,7 @@ export default function CodegenAppShell() {
             repaired: response.repaired,
             fallbackUsed: response.fallbackUsed,
             staticCode: response.requiresReplan
-              ? `${response.staticEvaluation.code} [${response.executionEngine?.strategy ?? 'replan_required'}]`
+              ? `${response.staticEvaluation.code} [${response.executionEngine?.strategy ?? 'plan_then_execute'}]`
               : response.staticEvaluation.code,
             testsRun: ['static-evaluator', 'sandbox-ready', 'sandbox-runTests'],
             filesProduced: ['indexHtml', 'gameJs', 'styleCss', 'manifestJson'],
@@ -1157,15 +1154,15 @@ export default function CodegenAppShell() {
         return mergeServerProjectIntoWorkspace(locallyUpdated, response.project);
       }
 
-      if (isServerBackedProject(activeProject)) {
-        return updateProject(prev, activeProject.id, project => ({
+      if (!response.project && response.persistenceWarning) {
+        return updateProject(locallyUpdated, activeProject.id, project => ({
           ...project,
           messages: [
             ...project.messages,
             makeChatMessage({
               role: 'system',
               mode: 'system',
-              text: `Server persistence failed; the generated package was not adopted as the canonical head. ${response.persistenceWarning ?? ''}`.trim(),
+              text: `Server persistence warning: ${response.persistenceWarning}`,
             }),
           ],
         }));
@@ -1188,7 +1185,7 @@ export default function CodegenAppShell() {
     setPhases([
       phases[0] ?? {
         id: 'generator',
-        label: '架构师/工人/修理工',
+        label: '生成器/修复器',
         state: 'idle',
         detail: '等待任务',
         elapsedMs: 0,
@@ -1225,7 +1222,7 @@ export default function CodegenAppShell() {
         : project.lastExecutionTrace,
     }));
 
-    if (isServerBackedProject(activeProject)) {
+    if (isServerBackedProject(activeProject) && !activeAiSession) {
       const currentHeadVersion = getHeadVersion(activeProject);
       if (currentHeadVersion > 0) {
         void updateProjectEvaluation({
@@ -1492,6 +1489,8 @@ export default function CodegenAppShell() {
                       {
                         sessionId: activeAiSessionSnapshot.session.id,
                         status: activeAiSessionSnapshot.session.status,
+                        activeWorkspaceVersion: activeAiSessionSnapshot.session.activeWorkspaceVersion,
+                        latestWorkspaceVersion: activeAiSessionSnapshot.session.latestWorkspaceVersion,
                         authState: activeAiSessionSnapshot.session.authState,
                         boxId: activeAiSessionSnapshot.session.boxId,
                         boxStatus: activeAiSessionSnapshot.session.boxStatus,
@@ -1524,7 +1523,12 @@ export default function CodegenAppShell() {
                 >
                   Init Codex
                 </button>
-                <button className={styles.btn} type="button" onClick={() => void handleCheckpointAiSession()} disabled={busy || sessionBusy || !activeAiSession}>
+                <button
+                  className={styles.btn}
+                  type="button"
+                  onClick={() => void handleCheckpointAiSession()}
+                  disabled={busy || sessionBusy || !activeAiSession || activeProject.selectedModifyBaseId !== '__current__'}
+                >
                   Checkpoint
                 </button>
                 <button className={styles.btnDanger} type="button" onClick={() => void handleRevokeAiSession()} disabled={busy || sessionBusy || !activeAiSession}>

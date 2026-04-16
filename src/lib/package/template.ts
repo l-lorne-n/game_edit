@@ -17,13 +17,6 @@ export function createTemplatePackage(seed: string): GeneratedGamePackage {
   const manifest: GamePackageManifest = {
     title,
     summary: 'A small browser mini-game scaffold generated as a safe fallback package.',
-    editable: [
-      'game speed',
-      'player color',
-      'obstacle count',
-      'win condition text',
-      'background color',
-    ],
     capabilities: [],
     notes: 'Fallback package used when model output is missing or invalid.',
   };

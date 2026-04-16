@@ -1,7 +1,4 @@
-import type { EvaluatorResult } from '@/lib/evaluator/types';
-import { makeEvaluatorResult } from '@/lib/evaluator/types';
 import type { GeneratedGamePackage } from '@/lib/package/contracts';
-import { parseGeneratedGamePackage } from '@/lib/package/contracts';
 import type { PackageSolveResult } from '@/lib/ai/generate-package';
 import { runAppServerPackageExecutor } from '@/lib/ai/executors/app-server-package-executor';
 import { runLegacyPackageExecutor } from '@/lib/ai/executors/legacy-package-executor';
@@ -23,7 +20,6 @@ export type RunCodexPackageTaskInput = {
   routeMode?: 'design' | 'patch' | 'repair';
   routeReason?: string;
   allowedPaths?: string[];
-  checkpointOnSuccess?: boolean;
 };
 
 export type CodexTaskEnvelope = {
@@ -36,7 +32,6 @@ export type CodexTaskEnvelope = {
   routeMode: 'design' | 'patch' | 'repair' | null;
   routeReason: string | null;
   allowedPaths: string[];
-  checkpointOnSuccess: boolean;
   fallbackReason: string | null;
 };
 
@@ -67,56 +62,15 @@ async function executeTask(requestedEngine: CodexExecutionEngine, input: RunCode
 }
 
 function resolveStrategy(input: RunCodexPackageTaskInput): CodexExecutionStrategy {
-  if (input.mode === 'create') {
-    return 'plan_then_execute';
-  }
-
   if (input.mode === 'debug') {
     return 'repair_execute';
   }
 
-  if (input.routeMode === 'design') {
-    return 'replan_required';
-  }
-
-  return 'patch_execute';
+  return 'plan_then_execute';
 }
 
 function resolveAllowedPaths(input: RunCodexPackageTaskInput): string[] {
   return input.allowedPaths ?? ['indexHtml', 'gameJs', 'styleCss', 'manifestJson'];
-}
-
-function toReplanFallbackResult(input: RunCodexPackageTaskInput): PackageSolveResult {
-  const pkg = input.currentPackage ?? input.lastKnownGoodPackage;
-  if (!pkg) {
-    throw new Error('A baseline package is required when modify escalates to re-plan.');
-  }
-  const parsed = parseGeneratedGamePackage(pkg);
-  if (!parsed.ok) {
-    throw new Error('Current package is invalid and cannot be used for a re-plan fallback result.');
-  }
-
-  const staticEvaluation: EvaluatorResult = makeEvaluatorResult({
-    ok: false,
-    code: 'TEST_FAILED',
-    source: 'static',
-    summary: 'Modify request exceeds the declared editable scope and needs a re-plan/create flow.',
-    errors: ['This modify request exceeded the editable scope and was not executed.'],
-    logs: ['route-engine: modify escalated to replan_required'],
-  });
-
-  return {
-    pkg,
-    manifest: parsed.manifest,
-    staticEvaluation,
-    repaired: false,
-    fallbackUsed: false,
-    source: 'template',
-    statusMessage: 'Route escalation required: modify request exceeded editable scope.',
-    provider: 'route-engine',
-    model: 'none',
-    attempts: [],
-  };
 }
 
 export async function runCodexPackageTask(input: RunCodexPackageTaskInput): Promise<RunCodexPackageTaskResult> {
@@ -131,29 +85,17 @@ export async function runCodexPackageTask(input: RunCodexPackageTaskInput): Prom
     routeMode: input.routeMode ?? null,
     routeReason: input.routeReason ?? null,
     allowedPaths: resolveAllowedPaths(input),
-    checkpointOnSuccess: Boolean(input.checkpointOnSuccess),
     fallbackReason: null,
   };
 
-  let solveResult: PackageSolveResult;
-  if (strategy === 'replan_required') {
-    solveResult = toReplanFallbackResult(input);
-  } else {
-    const execution = await executeTask(envelope.requestedEngine, input);
-    solveResult = execution.solveResult;
-    envelope.actualEngine = execution.actualEngine;
-    envelope.fallbackReason = execution.fallbackReason;
-  }
-
-  if (strategy === 'replan_required') {
-    envelope.actualEngine = 'legacy-model';
-  } else {
-    envelope.actualEngine = envelope.actualEngine;
-  }
+  const execution = await executeTask(envelope.requestedEngine, input);
+  const solveResult: PackageSolveResult = execution.solveResult;
+  envelope.actualEngine = execution.actualEngine;
+  envelope.fallbackReason = execution.fallbackReason;
 
   return {
     envelope,
-    requiresReplan: strategy === 'replan_required',
+    requiresReplan: false,
     solveResult,
     executionTraceMeta: {
       requestedEngine: envelope.requestedEngine,

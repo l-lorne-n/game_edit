@@ -46,7 +46,7 @@ function sharedRules(allowedPaths: string[]): string {
     '4) Do not answer with prose instead of editing files.',
     '5) If you describe anything in chat, keep it minimal; the files are the real output.',
     '6) For manifest.json, do NOT invent your own schema. Use the exact schema and enum values from the contract files.',
-    `7) In this turn you may modify ONLY these files: ${allowedPaths.join(', ')}.`,
+        `7) In this turn you may modify ONLY these files: ${allowedPaths.join(', ')}.`,
     '8) Before finishing, ensure manifest.json is valid JSON and that every required file contains real content, not placeholders.',
   ].join('\n');
 }
@@ -83,10 +83,10 @@ Routing context:
 
 Execution requirements:
 - Read the current workspace files directly instead of relying on stale memory.
-- Preserve the current game unless the instruction requires a local change.
+- Apply the requested change directly to the package, even if it touches gameplay rules, layout, visuals, or structure.
 - Only edit the allowed files listed above.
 - Keep the final package valid and fully non-empty in all four required files.
-- Update manifest.json if the title, summary, editable controls, or capabilities meaningfully change.`;
+- Update manifest.json if the title, summary, notes, or capabilities meaningfully change.`;
   }
 
   return `${rules}
