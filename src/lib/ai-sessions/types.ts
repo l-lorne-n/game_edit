@@ -70,6 +70,8 @@ export type AiSessionTransportSnapshot = {
   requiresReinit: boolean;
 };
 
+export type AiSessionRecoveryOutcome = 'none' | 'same_thread_resumed' | 'same_rollout_thread_restarted';
+
 export type AiSessionRecord = {
   id: string;
   projectId: string;
@@ -87,8 +89,15 @@ export type AiSessionRecord = {
   daemonStatus: AiSessionDaemonState;
   appServerThreadId: string | null;
   threadMaterializedAt: string | null;
+   transportPhase: AiSessionTransportPhase;
+   transportInitializedAt: string | null;
+   transportLastActivityAt: string | null;
+   transportIdleDeadlineAt: string | null;
+   transportLastErrorCode: string | null;
+   transportLastErrorMessage: string | null;
   continuityState: AiSessionContinuityState;
   resumeEligibility: AiSessionResumeEligibility;
+   recoveryOutcome: AiSessionRecoveryOutcome;
   supervisorInstanceId: string | null;
   supervisorLeaseEpoch: number;
   lastSupervisorHeartbeatAt: string | null;
@@ -123,6 +132,24 @@ export type AiSessionCheckpointRecord = {
   updatedAt: string;
 };
 
+export type AiSessionWorkspaceVersion = {
+  versionId: string;
+  workspaceVersion: number;
+  createdAt: string;
+  isActive: boolean;
+  isLatest: boolean;
+  sourceTargetId: string | null;
+};
+
+export type AiSessionWorkspaceVersionPayload = AiSessionWorkspaceVersion & {
+  package: {
+    indexHtml: string;
+    gameJs: string;
+    styleCss: string;
+    manifestJson: string;
+  };
+};
+
 export type CreateAiSessionInput = {
   projectId: string;
   ownerId: string;
@@ -142,13 +169,20 @@ export type UpdateAiSessionInput = Partial<
       | 'boxId'
     | 'codexHomeKey'
     | 'boxStatus'
-    | 'appServerStatus'
-    | 'daemonStatus'
-    | 'appServerThreadId'
-    | 'threadMaterializedAt'
-    | 'continuityState'
-    | 'resumeEligibility'
-    | 'supervisorInstanceId'
+      | 'appServerStatus'
+      | 'daemonStatus'
+      | 'appServerThreadId'
+      | 'threadMaterializedAt'
+      | 'transportPhase'
+      | 'transportInitializedAt'
+      | 'transportLastActivityAt'
+      | 'transportIdleDeadlineAt'
+      | 'transportLastErrorCode'
+      | 'transportLastErrorMessage'
+      | 'continuityState'
+      | 'resumeEligibility'
+      | 'recoveryOutcome'
+      | 'supervisorInstanceId'
     | 'supervisorLeaseEpoch'
     | 'lastSupervisorHeartbeatAt'
     | 'lastFailureCode'
@@ -183,6 +217,8 @@ export type AiSessionRepository = {
   updateSession(sessionId: string, input: UpdateAiSessionInput): Promise<AiSessionRecord>;
   appendEvent(input: CreateAiSessionEventInput): Promise<AiSessionEventRecord>;
   listEvents(sessionId: string): Promise<AiSessionEventRecord[]>;
+  appendTransportLog(sessionId: string, entry: AiSessionTransportLogEntry): Promise<AiSessionTransportLogEntry>;
+  listTransportLogs(sessionId: string): Promise<AiSessionTransportLogEntry[]>;
   findCheckpointByIdempotencyKey(sessionId: string, idempotencyKey: string): Promise<AiSessionCheckpointRecord | null>;
   createCheckpoint(input: CreateAiSessionCheckpointInput): Promise<AiSessionCheckpointRecord>;
 };

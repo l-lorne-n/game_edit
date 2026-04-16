@@ -6,6 +6,8 @@ import type {
   AiSessionRecord,
   AiSessionTransportLogEntry,
   AiSessionTransportSnapshot,
+  AiSessionWorkspaceVersion,
+  AiSessionWorkspaceVersionPayload,
 } from '@/lib/ai-sessions/types';
 import type { HostTokenSessionMetadata } from '@/lib/host-tokens/types';
 import type { HydratedProjectRecord } from '@/lib/projects/types';
@@ -223,4 +225,26 @@ export async function getAiSessionSnapshot(sessionId: string): Promise<AiSession
     events: payload.events,
     transport: payload.transport ?? null,
   };
+}
+
+export async function listAiSessionVersions(sessionId: string): Promise<AiSessionWorkspaceVersion[]> {
+  const response = await fetch(`/api/ai/sessions/${sessionId}/versions`, {
+    cache: 'no-store',
+  });
+  const json = await parseJson<{ ok: boolean; versions?: AiSessionWorkspaceVersion[]; error?: string }>(response);
+  if (!response.ok || !json.ok || !json.versions) {
+    throw new Error(json.error ?? `Failed to list versions for AI session ${sessionId}`);
+  }
+  return json.versions;
+}
+
+export async function getAiSessionVersionPayload(sessionId: string, versionId: string): Promise<AiSessionWorkspaceVersionPayload> {
+  const response = await fetch(`/api/ai/sessions/${sessionId}/versions/${encodeURIComponent(versionId)}`, {
+    cache: 'no-store',
+  });
+  const json = await parseJson<{ ok: boolean; error?: string } & Partial<AiSessionWorkspaceVersionPayload>>(response);
+  if (!response.ok || !json.ok || !json.package) {
+    throw new Error(json.error ?? `Failed to load version ${versionId} for AI session ${sessionId}`);
+  }
+  return json as AiSessionWorkspaceVersionPayload;
 }

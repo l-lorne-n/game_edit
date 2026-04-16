@@ -14,9 +14,11 @@ import {
   initAiSessionTransport,
   listProjectAiSessions,
   revokeAiSession,
+  listAiSessionVersions,
+  getAiSessionVersionPayload,
   type AiSessionSnapshot,
 } from '@/lib/ai-sessions/client';
-import type { AiSessionTransportLogEntry, AiSessionTransportSnapshot } from '@/lib/ai-sessions/types';
+import type { AiSessionTransportLogEntry, AiSessionTransportSnapshot, AiSessionWorkspaceVersion, AiSessionWorkspaceVersionPayload } from '@/lib/ai-sessions/types';
 import type { EvaluatorResult } from '@/lib/evaluator/types';
 import type { HostTokenSessionMetadata } from '@/lib/host-tokens/types';
 import type { GamePackageManifest, GeneratedGamePackage } from '@/lib/package/contracts';
@@ -243,6 +245,9 @@ export default function CodegenAppShell() {
   const [codexPanels, setCodexPanels] = useState<Record<string, CodexPanelState | null>>({});
   const [codexLogsBusy, setCodexLogsBusy] = useState(false);
   const [hostAuthSession, setHostAuthSession] = useState<HostTokenSessionMetadata | null>(null);
+  const [aiSessionVersions, setAiSessionVersions] = useState<AiSessionWorkspaceVersion[]>([]);
+  const [viewedAiSessionVersion, setViewedAiSessionVersion] = useState<AiSessionWorkspaceVersionPayload | null>(null);
+  const [viewedAiSessionVersionId, setViewedAiSessionVersionId] = useState<string>('');
 
   const phaseStartedRef = useRef<Record<'generator' | 'tester' | 'checker', number>>({
     generator: 0,
@@ -642,6 +647,37 @@ export default function CodegenAppShell() {
     };
   }, [activeAiSessionId, activeProjectId]);
 
+  useEffect(() => {
+    if (!activeAiSessionId) {
+      setAiSessionVersions([]);
+      setViewedAiSessionVersion(null);
+      setViewedAiSessionVersionId('');
+      return;
+    }
+
+    let cancelled = false;
+    async function fetchVersions() {
+      try {
+        const versions = await listAiSessionVersions(activeAiSessionId!);
+        if (!cancelled) {
+          setAiSessionVersions(versions);
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    void fetchVersions();
+    const timer = window.setInterval(() => {
+      void fetchVersions();
+    }, 5000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeAiSessionId]);
+
   async function handleCreateProject(): Promise<void> {
     if (!workspace || busy) {
       return;
@@ -840,6 +876,31 @@ export default function CodegenAppShell() {
       return;
     }
     window.alert('Server-backed versions are immutable. Restore only switches preview; it does not delete or fork versions by itself.');
+  }
+
+  async function handleSelectAiSessionVersion(versionId: string): Promise<void> {
+    setViewedAiSessionVersionId(versionId);
+    if (!versionId) {
+      setViewedAiSessionVersion(null);
+      return;
+    }
+
+    if (!activeAiSessionId) {
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const payload = await getAiSessionVersionPayload(activeAiSessionId, versionId);
+      setViewedAiSessionVersion(payload);
+      setRuntimeNonce(prev => prev + 1);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : String(error));
+      setViewedAiSessionVersionId('');
+      setViewedAiSessionVersion(null);
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function handleSubmit(): Promise<void> {
@@ -1256,7 +1317,7 @@ export default function CodegenAppShell() {
     activeProject.selectedDebugTargetId || (debugTargets.length === 1 ? debugTargets[0] : '');
   const looksLikeDebug = inferDebugSuggestion(composerText);
   const requireDebugTargetChoice = mode === 'debug' && debugTargets.length > 1 && !effectiveDebugTargetId;
-  const selectedPreviewLabel = parseManifestTitle(activeProject.currentPackage);
+  const selectedPreviewLabel = parseManifestTitle(viewedAiSessionVersion?.package ?? activeProject.currentPackage);
   const codexReady =
     !isServerBackedProject(activeProject) ||
     activeCodexPanel?.transport?.phase === 'ready' ||
@@ -1423,7 +1484,8 @@ export default function CodegenAppShell() {
                 disabled={
                   busy ||
                   !composerText.trim() ||
-                  (mode === 'debug' && requireDebugTargetChoice)
+                  (mode === 'debug' && requireDebugTargetChoice) ||
+                  Boolean(viewedAiSessionVersionId)
                 }
                 onClick={() => {
                   handleSubmit().catch(error => {
@@ -1447,6 +1509,7 @@ export default function CodegenAppShell() {
               <span className={styles.mono}>{busy ? 'Working...' : 'Idle'}</span>
             </div>
             {!codexReady ? <span className={styles.mono}>Send will auto-initialize Codex if OAuth is ready.</span> : null}
+            {viewedAiSessionVersionId ? <span className={styles.mono} style={{ color: 'var(--text-dim)' }}>Cannot send requests while viewing a read-only Box version. Switch to Active Head first.</span> : null}
           </div>
 
           {isServerBackedProject(activeProject) ? (
@@ -1606,18 +1669,44 @@ export default function CodegenAppShell() {
              </button>
           </div>
 
+          {activeAiSessionId && aiSessionVersions.length > 0 ? (
+            <div className={styles.row} style={{ marginTop: 8 }}>
+              <span className={styles.mono}>Box Versions:</span>
+              <select
+                className={styles.select}
+                value={viewedAiSessionVersionId}
+                onChange={event => void handleSelectAiSessionVersion(event.target.value)}
+                disabled={busy}
+              >
+                <option value="">(View Active Head)</option>
+                {aiSessionVersions.map(version => (
+                  <option key={version.versionId} value={version.versionId}>
+                    {version.versionId} (v{version.workspaceVersion}) {version.isActive ? '[Active]' : ''} {version.isLatest ? '[Latest]' : ''}
+                  </option>
+                ))}
+              </select>
+              {viewedAiSessionVersionId ? (
+                <span className={styles.mono} style={{ color: 'var(--text-dim)' }}>
+                  Viewing read-only Box version.
+                </span>
+              ) : null}
+            </div>
+          ) : null}
+
           <div className={styles.previewBody}>
             <SandboxPreview
-              packageData={activeProject.currentPackage}
+              packageData={viewedAiSessionVersion?.package ?? activeProject.currentPackage}
               runtimeNonce={runtimeNonce}
               onReport={handleSandboxReport}
             />
           </div>
 
           <pre className={styles.mono} style={{ margin: 0, whiteSpace: 'pre-wrap' }}>
-            {activeProject.currentPackage
-              ? activeProject.currentPackage.manifestJson
-              : 'No package loaded yet.'}
+            {viewedAiSessionVersion?.package
+              ? viewedAiSessionVersion.package.manifestJson
+              : activeProject.currentPackage
+                ? activeProject.currentPackage.manifestJson
+                : 'No package loaded yet.'}
           </pre>
         </section>
       </section>
