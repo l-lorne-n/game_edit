@@ -76,6 +76,7 @@ export async function POST(request: Request) {
       provider: result.solveResult.provider,
       model: result.solveResult.model,
       attempts: result.solveResult.attempts,
+      requiresReinit: result.requiresReinit,
       executionEngine: result.executionTraceMeta,
       serverRouteDecision,
       project: persistedProject,

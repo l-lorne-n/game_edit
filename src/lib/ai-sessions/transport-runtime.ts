@@ -24,6 +24,16 @@ type TransportRuntimeRecord = {
   turnTranscript: AiSessionTransportLogEntry[];
 };
 
+export type PersistedTransportRuntimeState = {
+  phase: AiSessionTransportPhase;
+  threadId: string | null;
+  initializedAt: string | null;
+  lastActivityAt: string | null;
+  idleDeadlineAt: string | null;
+  lastErrorCode: string | null;
+  lastErrorMessage: string | null;
+};
+
 const runtimeBySession = new Map<string, TransportRuntimeRecord>();
 
 function nowIso(): string {
@@ -63,6 +73,24 @@ function createBaseRecord(): TransportRuntimeRecord {
     lastErrorMessage: null,
     initTranscript: [],
     turnTranscript: [],
+  };
+}
+
+function restoreRecord(
+  state: PersistedTransportRuntimeState,
+  initTranscript: AiSessionTransportLogEntry[],
+  turnTranscript: AiSessionTransportLogEntry[],
+): TransportRuntimeRecord {
+  return {
+    phase: state.phase,
+    threadId: state.threadId,
+    initializedAt: state.initializedAt,
+    lastActivityAt: state.lastActivityAt,
+    idleDeadlineAt: state.idleDeadlineAt,
+    lastErrorCode: state.lastErrorCode,
+    lastErrorMessage: state.lastErrorMessage,
+    initTranscript: trimEntries(initTranscript),
+    turnTranscript: trimEntries(turnTranscript),
   };
 }
 
@@ -239,6 +267,21 @@ export function appendAiSessionTransportLog(
 
 export function clearAiSessionTransport(sessionId: string): void {
   runtimeBySession.delete(sessionId);
+}
+
+export function hasAiSessionTransportRuntime(sessionId: string): boolean {
+  return runtimeBySession.has(sessionId);
+}
+
+export function restoreAiSessionTransport(
+  sessionId: string,
+  state: PersistedTransportRuntimeState,
+  initTranscript: AiSessionTransportLogEntry[],
+  turnTranscript: AiSessionTransportLogEntry[],
+): AiSessionTransportSnapshot {
+  const restored = restoreRecord(state, initTranscript, turnTranscript);
+  runtimeBySession.set(sessionId, restored);
+  return toSnapshot(restored);
 }
 
 export function syncAiSessionTransportThreadId(sessionId: string, threadId: string | null): AiSessionTransportSnapshot {

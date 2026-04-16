@@ -72,6 +72,35 @@ class AiSessionSupervisor {
     return structuredClone(existing);
   }
 
+  restoreRuntime(session: AiSessionRecord): AiSessionSupervisorRuntime | null {
+    if (!session.supervisorInstanceId || session.supervisorLeaseEpoch <= 0) {
+      return null;
+    }
+
+    const existing = this.runtimes.get(session.id);
+    if (existing && existing.supervisorInstanceId === session.supervisorInstanceId && existing.supervisorLeaseEpoch === session.supervisorLeaseEpoch) {
+      return structuredClone(existing);
+    }
+
+    const restored: AiSessionSupervisorRuntime = {
+      sessionId: session.id,
+      projectId: session.projectId,
+      boxId: session.boxId,
+      codexHomeKey: session.codexHomeKey,
+      supervisorInstanceId: session.supervisorInstanceId,
+      supervisorLeaseEpoch: session.supervisorLeaseEpoch,
+      daemonStatus: session.daemonStatus,
+      continuityState: session.continuityState,
+      resumeEligibility: session.resumeEligibility,
+      threadId: session.appServerThreadId,
+      threadMaterializedAt: session.threadMaterializedAt,
+      lastHeartbeatAt: session.lastSupervisorHeartbeatAt ?? nowIso(),
+      lastFailureCode: session.lastFailureCode,
+    };
+    this.runtimes.set(session.id, restored);
+    return structuredClone(restored);
+  }
+
   heartbeat(sessionId: string): AiSessionSupervisorRuntime | null {
     const existing = this.runtimes.get(sessionId);
     if (!existing) {

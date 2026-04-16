@@ -47,6 +47,7 @@ export type RunCodexPackageTaskResult = {
     allowedPaths: string[];
     fallbackReason: string | null;
   };
+  requiresReinit: boolean;
 };
 
 function getExecutionEngine(): CodexExecutionEngine {
@@ -105,5 +106,6 @@ export async function runCodexPackageTask(input: RunCodexPackageTaskInput): Prom
       allowedPaths: envelope.allowedPaths,
       fallbackReason: envelope.fallbackReason,
     },
+    requiresReinit: execution.requiresReinit,
   };
 }

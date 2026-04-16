@@ -94,6 +94,7 @@ export async function POST(request: Request) {
       model: result.solveResult.model,
       attempts: result.solveResult.attempts,
       requiresReplan: result.requiresReplan,
+      requiresReinit: result.requiresReinit,
       executionEngine: result.executionTraceMeta,
       serverRouteDecision,
       project: persistedProject,

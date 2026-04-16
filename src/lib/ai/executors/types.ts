@@ -24,4 +24,5 @@ export type PackageExecutorResult = {
   solveResult: PackageSolveResult;
   actualEngine: CodexExecutionEngine;
   fallbackReason: string | null;
+  requiresReinit: boolean;
 };

@@ -122,8 +122,15 @@ export const aiSessions = pgTable('ai_sessions', {
   daemonStatus: text('daemon_status').notNull().default('stopped'),
   appServerThreadId: text('app_server_thread_id'),
   threadMaterializedAt: timestamp('thread_materialized_at', { withTimezone: true }),
+  transportPhase: text('transport_phase').notNull().default('uninitialized'),
+  transportInitializedAt: timestamp('transport_initialized_at', { withTimezone: true }),
+  transportLastActivityAt: timestamp('transport_last_activity_at', { withTimezone: true }),
+  transportIdleDeadlineAt: timestamp('transport_idle_deadline_at', { withTimezone: true }),
+  transportLastErrorCode: text('transport_last_error_code'),
+  transportLastErrorMessage: text('transport_last_error_message'),
   continuityState: text('continuity_state').notNull().default('new'),
   resumeEligibility: text('resume_eligibility').notNull().default('not_resumable'),
+  recoveryOutcome: text('recovery_outcome').notNull().default('none'),
   supervisorInstanceId: text('supervisor_instance_id'),
   supervisorLeaseEpoch: integer('supervisor_lease_epoch').notNull().default(0),
   lastSupervisorHeartbeatAt: timestamp('last_supervisor_heartbeat_at', { withTimezone: true }),
@@ -166,6 +173,17 @@ export const aiSessionCheckpoints = pgTable('ai_session_checkpoints', {
     .notNull()
     .defaultNow()
     .$onUpdateFn(() => sql`now()`),
+});
+
+export const aiSessionTransportLogs = pgTable('ai_session_transport_logs', {
+  id: text('id').primaryKey(),
+  sessionId: text('session_id')
+    .notNull()
+    .references(() => aiSessions.id, { onDelete: 'cascade' }),
+  phase: text('phase').notNull(),
+  direction: text('direction').notNull(),
+  message: text('message').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull(),
 });
 
 export const hostAuthPendingStates = pgTable('host_auth_pending_states', {
@@ -264,6 +282,8 @@ export type AiSessionEvent = typeof aiSessionEvents.$inferSelect;
 export type NewAiSessionEvent = typeof aiSessionEvents.$inferInsert;
 export type AiSessionCheckpoint = typeof aiSessionCheckpoints.$inferSelect;
 export type NewAiSessionCheckpoint = typeof aiSessionCheckpoints.$inferInsert;
+export type AiSessionTransportLog = typeof aiSessionTransportLogs.$inferSelect;
+export type NewAiSessionTransportLog = typeof aiSessionTransportLogs.$inferInsert;
 export type HostAuthPendingState = typeof hostAuthPendingStates.$inferSelect;
 export type NewHostAuthPendingState = typeof hostAuthPendingStates.$inferInsert;
 export type HostBrowserAuthAttempt = typeof hostBrowserAuthAttempts.$inferSelect;

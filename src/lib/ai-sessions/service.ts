@@ -6,9 +6,11 @@ import {
   clearAiSessionTransport,
   expireAiSessionTransportIfIdle,
   getAiSessionTransportSnapshot,
+  hasAiSessionTransportRuntime,
   listAiSessionTransportLogs,
   markAiSessionTransportLost,
   markAiSessionTransportReady,
+  restoreAiSessionTransport,
   startAiSessionTransportInit,
   startAiSessionTransportTurn,
   finishAiSessionTransportTurn,
@@ -201,6 +203,141 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
     throw new Error(`Unknown modify target: ${targetId}`);
   }
 
+  function toTransportSnapshotState(session: AiSessionRecord) {
+    return {
+      phase: session.transportPhase,
+      threadId: session.appServerThreadId,
+      initializedAt: session.transportInitializedAt,
+      lastActivityAt: session.transportLastActivityAt,
+      idleDeadlineAt: session.transportIdleDeadlineAt,
+      lastErrorCode: session.transportLastErrorCode,
+      lastErrorMessage: session.transportLastErrorMessage,
+    };
+  }
+
+  function toTransportSessionUpdate(snapshot: AiSessionTransportSnapshot) {
+    return {
+      transportPhase: snapshot.phase,
+      transportInitializedAt: snapshot.initializedAt,
+      transportLastActivityAt: snapshot.lastActivityAt,
+      transportIdleDeadlineAt: snapshot.idleDeadlineAt,
+      transportLastErrorCode: snapshot.lastErrorCode,
+      transportLastErrorMessage: snapshot.lastErrorMessage,
+    };
+  }
+
+  async function persistTransportSnapshot(sessionId: string, snapshot: AiSessionTransportSnapshot) {
+    await repository.updateSession(sessionId, toTransportSessionUpdate(snapshot));
+    return snapshot;
+  }
+
+  async function appendTransportLog(sessionId: string, phase: 'init' | 'turn', direction: 'outbound' | 'inbound' | 'system', message: unknown) {
+    const entry = appendAiSessionTransportLog(sessionId, phase, direction, message);
+    await repository.appendTransportLog(sessionId, entry);
+    const session = await repository.getSession(sessionId);
+    if (session) {
+      await repository.updateSession(sessionId, {
+        transportLastActivityAt: entry.createdAt,
+        transportIdleDeadlineAt: session.transportPhase !== 'initializing'
+          ? new Date(new Date(entry.createdAt).getTime() + 10 * 60 * 1000).toISOString()
+          : null,
+      });
+    }
+    return entry;
+  }
+
+  async function rehydrateTransportRuntime(session: AiSessionRecord) {
+    if (hasAiSessionTransportRuntime(session.id)) {
+      return getAiSessionTransportSnapshot(session);
+    }
+
+    const persistedLogs = await repository.listTransportLogs(session.id);
+    const initTranscript = persistedLogs.filter(entry => entry.phase === 'init');
+    const turnTranscript = persistedLogs.filter(entry => entry.phase === 'turn');
+    const restored = restoreAiSessionTransport(session.id, toTransportSnapshotState(session), initTranscript, turnTranscript);
+    if (session.supervisorInstanceId && session.supervisorLeaseEpoch > 0) {
+      supervisor.restoreRuntime(session);
+    }
+    return restored;
+  }
+
+  async function updateRecoveryOutcome(sessionId: string, recoveryOutcome: 'none' | 'same_thread_resumed' | 'same_rollout_thread_restarted') {
+    return repository.updateSession(sessionId, { recoveryOutcome });
+  }
+
+  async function getWorkspaceVersionMetas(session: AiSessionRecord) {
+    const events = await repository.listEvents(session.id);
+    const byVersion = new Map<number, { workspaceVersion: number; createdAt: string; sourceTargetId: string | null }>();
+    const latestVisibleVersion = getLatestWorkspaceVersion(session);
+
+    const register = (workspaceVersion: number | null | undefined, createdAt: string, sourceTargetId: string | null) => {
+      if (!workspaceVersion || workspaceVersion <= 0 || workspaceVersion > latestVisibleVersion || byVersion.has(workspaceVersion)) {
+        return;
+      }
+      byVersion.set(workspaceVersion, { workspaceVersion, createdAt, sourceTargetId });
+    };
+
+    for (const event of events) {
+      if (event.type === 'workspace.hydrated') {
+        register(Number(event.payload.workspaceVersion ?? 0), event.createdAt, null);
+      }
+      if (event.type === 'workspace.version_staged') {
+        register(Number(event.payload.stagedWorkspaceVersion ?? 0), event.createdAt, typeof event.payload.baseTargetId === 'string' ? event.payload.baseTargetId : null);
+      }
+    }
+
+    for (let workspaceVersion = 1; workspaceVersion <= latestVisibleVersion; workspaceVersion += 1) {
+      if (!byVersion.has(workspaceVersion)) {
+        register(workspaceVersion, session.createdAt, null);
+      }
+    }
+
+    return [...byVersion.values()]
+      .sort((left, right) => left.workspaceVersion - right.workspaceVersion)
+      .map(item => ({
+        versionId: getAiSessionVersionTargetId(item.workspaceVersion),
+        workspaceVersion: item.workspaceVersion,
+        createdAt: item.createdAt,
+        isActive: item.workspaceVersion === getActiveWorkspaceVersion(session),
+        isLatest: item.workspaceVersion === getLatestWorkspaceVersion(session),
+        sourceTargetId: item.sourceTargetId,
+      }));
+  }
+
+  async function tryResumeExistingThread(session: AiSessionRecord) {
+    if (!session.appServerThreadId || session.boxStatus !== 'ready') {
+      return null;
+    }
+
+    const sandboxProvider = getSandboxProvider();
+    const daemonHealth = await getCodexAppServerDaemonHealth(sandboxProvider, session.id);
+    if (!daemonHealth?.ok || !daemonHealth.initialized || daemonHealth.threadId !== session.appServerThreadId) {
+      return null;
+    }
+
+    const restoredTransport = await rehydrateTransportRuntime(session);
+    supervisor.restoreRuntime(session);
+    const readySnapshot = markAiSessionTransportReady(session.id, session.appServerThreadId);
+    await persistTransportSnapshot(session.id, readySnapshot);
+    const updatedSession = await repository.updateSession(session.id, {
+      appServerStatus: 'healthy',
+      daemonStatus: 'healthy',
+      continuityState: 'resumable',
+      resumeEligibility: 'resumable',
+      recoveryOutcome: 'same_thread_resumed',
+      lastFailureCode: null,
+    });
+    await repository.appendEvent({
+      sessionId: session.id,
+      type: 'transport.recovered_same_thread',
+      payload: {
+        threadId: session.appServerThreadId,
+        restoredPhase: restoredTransport.phase,
+      },
+    });
+    return { session: updatedSession, transport: readySnapshot };
+  }
+
   return {
     async createSession(input: CreateAiSessionInput): Promise<AiSessionRecord> {
       const existingSessions = await repository.listProjectSessions(input.projectId);
@@ -229,8 +366,15 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
         daemonStatus: 'stopped',
         appServerThreadId: null,
         threadMaterializedAt: null,
+        transportPhase: 'uninitialized',
+        transportInitializedAt: null,
+        transportLastActivityAt: null,
+        transportIdleDeadlineAt: null,
+        transportLastErrorCode: null,
+        transportLastErrorMessage: null,
         continuityState: 'new',
         resumeEligibility: 'not_resumable',
+        recoveryOutcome: 'none',
         supervisorInstanceId: null,
         supervisorLeaseEpoch: 0,
         lastSupervisorHeartbeatAt: null,
@@ -264,12 +408,18 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
         return null;
       }
 
+      await rehydrateTransportRuntime(session);
+
       const expired = expireAiSessionTransportIfIdle(sessionId);
       if (expired) {
         await repository.updateSession(sessionId, {
           appServerStatus: 'stopped',
           appServerThreadId: null,
+          continuityState: 'restart_required',
+          resumeEligibility: 'restart_required',
+          recoveryOutcome: 'none',
         });
+        await persistTransportSnapshot(sessionId, expired);
       }
 
       const freshSession = (expired ? await repository.getSession(sessionId) : session) ?? session;
@@ -282,15 +432,55 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
         throw new Error(`Unknown AI session ${sessionId}`);
       }
 
+      await rehydrateTransportRuntime(session);
+
       const expired = expireAiSessionTransportIfIdle(sessionId);
       if (expired) {
         await repository.updateSession(sessionId, {
           appServerStatus: 'stopped',
           appServerThreadId: null,
+          continuityState: 'restart_required',
+          resumeEligibility: 'restart_required',
+          recoveryOutcome: 'none',
         });
+        await persistTransportSnapshot(sessionId, expired);
       }
 
       return listAiSessionTransportLogs(sessionId);
+    },
+
+    async listWorkspaceVersions(sessionId: string) {
+      const session = await repository.getSession(sessionId);
+      if (!session) {
+        throw new Error(`Unknown AI session ${sessionId}`);
+      }
+
+      return getWorkspaceVersionMetas(session);
+    },
+
+    async getWorkspaceVersionPayload(sessionId: string, versionId: string) {
+      const session = await repository.getSession(sessionId);
+      if (!session) {
+        throw new Error(`Unknown AI session ${sessionId}`);
+      }
+
+      const workspaceVersion = parseAiSessionVersionTargetId(versionId);
+      if (!workspaceVersion) {
+        throw new Error(`Unknown workspace version: ${versionId}`);
+      }
+
+      if (workspaceVersion > getLatestWorkspaceVersion(session)) {
+        throw new Error(`Workspace version not found: ${versionId}`);
+      }
+
+      const pkg = await readWorkspacePackageVersion(sessionId, workspaceVersion);
+      return {
+        versionId,
+        workspaceVersion,
+        package: pkg,
+        isActive: workspaceVersion === getActiveWorkspaceVersion(session),
+        isLatest: workspaceVersion === getLatestWorkspaceVersion(session),
+      };
     },
 
     async listProjectSessions(projectId: string): Promise<AiSessionRecord[]> {
@@ -307,6 +497,7 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
         authState: 'ready',
         boxStatus: 'ready',
         appServerStatus: 'healthy',
+        recoveryOutcome: 'none',
       });
       await repository.appendEvent({ sessionId, type: 'session.ready' });
       return updated;
@@ -347,6 +538,7 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
         authState: 'revoked',
         continuityState: 'revoked',
         resumeEligibility: 'not_resumable',
+        recoveryOutcome: 'none',
         daemonStatus: 'terminated',
         lastFailureCode: null,
         revokedAt: now,
@@ -376,6 +568,7 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
         daemonStatus: 'starting',
         continuityState: 'auth_ready',
         resumeEligibility: 'not_resumable',
+        recoveryOutcome: 'none',
         codexHomeKey: getAiSessionWorkspaceRoot(sessionId),
         lastFailureCode: null,
       });
@@ -442,8 +635,15 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
         daemonStatus: 'stopped',
         appServerThreadId: null,
         threadMaterializedAt: null,
+        transportPhase: 'uninitialized',
+        transportInitializedAt: null,
+        transportLastActivityAt: null,
+        transportIdleDeadlineAt: null,
+        transportLastErrorCode: null,
+        transportLastErrorMessage: null,
         continuityState: 'auth_ready',
         resumeEligibility: 'not_resumable',
+        recoveryOutcome: 'none',
         lastFailureCode: null,
       });
 
@@ -459,7 +659,7 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
       return updated;
     },
 
-    async initializeTransport(sessionId: string, bindToken: string): Promise<{ session: AiSessionRecord; transport: AiSessionTransportSnapshot }> {
+    async initializeTransport(sessionId: string, bindToken: string | null): Promise<{ session: AiSessionRecord; transport: AiSessionTransportSnapshot }> {
       let session = await repository.getSession(sessionId);
       if (!session) {
         throw new Error(`Unknown AI session ${sessionId}`);
@@ -469,17 +669,29 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
         throw new AiSessionLeaseError(`AI session ${sessionId} has been revoked.`);
       }
 
+      await rehydrateTransportRuntime(session);
+
       const currentTransport = await this.getTransportSnapshot(sessionId);
+      const currentRuntime = supervisor.getRuntime(session);
       if (currentTransport?.phase === 'ready' && session.appServerThreadId) {
-        return { session, transport: currentTransport };
+        if (hasAiSessionTransportRuntime(sessionId) && currentRuntime) {
+          return { session, transport: currentTransport };
+        }
+        const resumed = await tryResumeExistingThread(session);
+        if (resumed) {
+          return resumed;
+        }
       }
 
       if (session.status !== 'ready' || session.boxStatus !== 'ready' || session.authState !== 'ready') {
+        if (!bindToken?.trim()) {
+          throw new AiSessionTransportNotInitializedError('Bind token is required to bootstrap this AI session transport.');
+        }
         session = await this.bootstrapSession(sessionId, bindToken);
       }
 
-      startAiSessionTransportInit(sessionId);
-      appendAiSessionTransportLog(sessionId, 'init', 'system', 'Starting Codex init sequence.');
+      await persistTransportSnapshot(sessionId, startAiSessionTransportInit(sessionId));
+      await appendTransportLog(sessionId, 'init', 'system', 'Starting Codex init sequence.');
       const runtime = supervisor.beginRuntime(session);
       await repository.updateSession(sessionId, {
         supervisorInstanceId: runtime.supervisorInstanceId,
@@ -488,6 +700,7 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
         daemonStatus: 'starting',
         continuityState: 'daemon_starting',
         resumeEligibility: 'not_resumable',
+        recoveryOutcome: session.appServerThreadId ? 'same_rollout_thread_restarted' : 'none',
         lastFailureCode: null,
       });
 
@@ -500,13 +713,14 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
           appServerThreadId: null,
           continuityState: 'failed',
           resumeEligibility: 'restart_required',
+          recoveryOutcome: 'none',
           lastFailureCode: 'codex_app_server_binary_missing',
         });
-        markAiSessionTransportLost(
+        await persistTransportSnapshot(sessionId, markAiSessionTransportLost(
           sessionId,
           'codex_app_server_binary_missing',
           runtimeState.reason ?? 'Codex runtime is not available in the Box.',
-        );
+        ));
         throw new AiSessionTransportNotImplementedError(
           runtimeState.reason ?? 'Codex runtime is not available in the Box.',
           'codex_app_server_binary_missing',
@@ -528,7 +742,7 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
       ];
 
       for (const message of messages) {
-        appendAiSessionTransportLog(sessionId, 'init', 'outbound', message);
+        await appendTransportLog(sessionId, 'init', 'outbound', message);
       }
 
       await ensureCodexAppServerDaemon(
@@ -546,7 +760,7 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
       });
 
       for (const message of startResult.messages) {
-        appendAiSessionTransportLog(sessionId, 'init', 'inbound', message);
+        await appendTransportLog(sessionId, 'init', 'inbound', message);
       }
 
       const loginError = findLoginError(startResult.messages);
@@ -559,13 +773,14 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
           appServerThreadId: null,
           continuityState: 'failed',
           resumeEligibility: 'restart_required',
+          recoveryOutcome: 'none',
           lastFailureCode: 'codex_app_server_external_auth_login_failed',
         });
-        markAiSessionTransportLost(
+        await persistTransportSnapshot(sessionId, markAiSessionTransportLost(
           sessionId,
           'codex_app_server_external_auth_login_failed',
           loginError ?? 'Codex app-server external auth login did not succeed.',
-        );
+        ));
         throw new AiSessionTransportNotImplementedError(
           loginError ?? 'Codex app-server external auth login did not succeed.',
           'codex_app_server_external_auth_login_failed',
@@ -579,13 +794,14 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
           appServerThreadId: null,
           continuityState: 'failed',
           resumeEligibility: 'restart_required',
+          recoveryOutcome: 'none',
           lastFailureCode: threadStartError ? 'codex_app_server_thread_start_failed' : 'codex_app_server_runner_failed',
         });
-        markAiSessionTransportLost(
+        await persistTransportSnapshot(sessionId, markAiSessionTransportLost(
           sessionId,
           threadStartError ? 'codex_app_server_thread_start_failed' : 'codex_app_server_runner_failed',
           threadStartError ?? runnerError ?? 'Codex app-server init failed after login.',
-        );
+        ));
         throw new AiSessionTransportNotImplementedError(
           threadStartError ?? runnerError ?? 'Codex app-server init failed after login.',
           threadStartError ? 'codex_app_server_thread_start_failed' : 'codex_app_server_runner_failed',
@@ -600,9 +816,10 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
           appServerThreadId: null,
           continuityState: 'failed',
           resumeEligibility: 'restart_required',
+          recoveryOutcome: 'none',
           lastFailureCode: 'codex_app_server_thread_start_failed',
         });
-        markAiSessionTransportLost(sessionId, 'codex_app_server_thread_start_failed', 'Codex app-server did not return a thread id.');
+        await persistTransportSnapshot(sessionId, markAiSessionTransportLost(sessionId, 'codex_app_server_thread_start_failed', 'Codex app-server did not return a thread id.'));
         throw new AiSessionTransportNotImplementedError(
           'Codex app-server did not return a thread id.',
           'codex_app_server_thread_start_failed',
@@ -616,6 +833,7 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
         appServerThreadId: threadId,
         continuityState: 'thread_started_provisional',
         resumeEligibility: 'provisional',
+        recoveryOutcome: session.threadMaterializedAt ? 'same_rollout_thread_restarted' : 'none',
         lastSupervisorHeartbeatAt: new Date().toISOString(),
         lastFailureCode: null,
       });
@@ -629,11 +847,14 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
         lastFailureCode: null,
       });
       syncAiSessionTransportThreadId(sessionId, threadId);
-      const transport = markAiSessionTransportReady(sessionId, threadId);
+      const transport = await persistTransportSnapshot(sessionId, markAiSessionTransportReady(sessionId, threadId));
       await repository.appendEvent({
         sessionId,
         type: 'transport.initialized',
-        payload: { threadId },
+        payload: {
+          threadId,
+          recoveryOutcome: updatedSession.recoveryOutcome,
+        },
       });
 
       return { session: updatedSession, transport };
@@ -728,37 +949,32 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
       workspaceRoot: string;
       baseTargetId: string | null;
     }> {
-      const session = await repository.getSession(sessionId);
+      let session = await repository.getSession(sessionId);
       if (!session) {
         throw new Error(`Unknown AI session ${sessionId}`);
       }
 
-      const transport = await this.getTransportSnapshot(sessionId);
-      const runtime = supervisor.getRuntime(session);
-      if (!transport || transport.phase !== 'ready' || !session.appServerThreadId) {
-        await repository.updateSession(sessionId, {
-          appServerStatus: 'stopped',
-          daemonStatus: 'stopped',
-          appServerThreadId: null,
-          continuityState: transport?.threadId ? 'continuity_lost' : 'restart_required',
-          resumeEligibility: 'restart_required',
-          lastFailureCode: 'codex_transport_not_initialized',
-        });
-        syncAiSessionTransportThreadId(sessionId, null);
-        throw new AiSessionTransportNotInitializedError();
-      }
+      const recovered = await this.initializeTransport(sessionId, null);
+      session = recovered.session;
+      const transport = recovered.transport;
+      let runtime = supervisor.getRuntime(session) ?? supervisor.restoreRuntime(session);
 
       if (!runtime) {
-        await repository.updateSession(sessionId, {
-          appServerStatus: 'stopped',
-          daemonStatus: 'stopped',
-          appServerThreadId: null,
-          continuityState: 'continuity_lost',
-          resumeEligibility: 'restart_required',
-          lastFailureCode: 'codex_supervisor_runtime_missing',
-        });
-        syncAiSessionTransportThreadId(sessionId, null);
-        throw new AiSessionTransportNotInitializedError('Codex supervisor runtime is missing for this AI session. Restart the session.');
+        const recoveredRuntime = supervisor.restoreRuntime(session);
+        if (!recoveredRuntime) {
+          await repository.updateSession(sessionId, {
+            appServerStatus: 'stopped',
+            daemonStatus: 'stopped',
+            appServerThreadId: null,
+            continuityState: 'continuity_lost',
+            resumeEligibility: 'restart_required',
+            recoveryOutcome: 'none',
+            lastFailureCode: 'codex_supervisor_runtime_missing',
+          });
+          await persistTransportSnapshot(sessionId, syncAiSessionTransportThreadId(sessionId, null));
+          throw new AiSessionTransportNotInitializedError('Codex supervisor runtime is missing for this AI session. Restart the session.');
+        }
+        runtime = recoveredRuntime;
       }
 
       supervisor.heartbeat(sessionId);
@@ -805,187 +1021,227 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
         },
       });
       await repository.updateSession(sessionId, { status: 'busy' });
-      startAiSessionTransportTurn(sessionId);
-      appendAiSessionTransportLog(
-        sessionId,
-        'turn',
-        'system',
-        `Starting ${input.mode} turn in workspace v${executionWorkspaceVersion}.`,
-      );
-
-      const sandboxProvider = getSandboxProvider();
-      const daemonHealth = await getCodexAppServerDaemonHealth(sandboxProvider, sessionId);
-      if (!daemonHealth) {
-        await repository.updateSession(sessionId, {
-          status: 'ready',
-          appServerStatus: 'stopped',
-          daemonStatus: 'stopped',
-          appServerThreadId: null,
-          continuityState: 'continuity_lost',
-          resumeEligibility: 'restart_required',
-          lastFailureCode: 'codex_daemon_unreachable',
-        });
-        markAiSessionTransportLost(sessionId, 'codex_daemon_unreachable', 'Codex daemon is not reachable for this AI session.');
-        supervisor.updateRuntime(sessionId, {
-          daemonStatus: 'stopped',
-          continuityState: 'continuity_lost',
-          resumeEligibility: 'restart_required',
-          threadId: null,
-          lastFailureCode: 'codex_daemon_unreachable',
-        });
-        syncAiSessionTransportThreadId(sessionId, null);
-        throw new AiSessionTransportNotInitializedError('Codex daemon is not reachable for this AI session. Restart the session.');
-      }
-
-      const runtimeState = await sandboxProvider.ensureCodexRuntime();
-      if (!runtimeState.ready) {
-        await repository.updateSession(sessionId, {
-          status: 'ready',
-          appServerStatus: 'failed',
-          daemonStatus: 'degraded',
-          appServerThreadId: null,
-          continuityState: 'failed',
-          resumeEligibility: 'restart_required',
-          lastFailureCode: 'codex_app_server_binary_missing',
-        });
-        markAiSessionTransportLost(
+      await persistTransportSnapshot(sessionId, startAiSessionTransportTurn(sessionId));
+      try {
+        await appendTransportLog(
           sessionId,
-          'codex_app_server_binary_missing',
-          runtimeState.reason ?? 'Codex runtime is not available in the Box.',
+          'turn',
+          'system',
+          `Starting ${input.mode} turn in workspace v${executionWorkspaceVersion}.`,
         );
-        supervisor.updateRuntime(sessionId, {
-          daemonStatus: 'degraded',
-          continuityState: 'failed',
-          resumeEligibility: 'restart_required',
-          threadId: null,
-          lastFailureCode: 'codex_app_server_binary_missing',
-        });
-        throw new AiSessionTransportNotImplementedError(
-          runtimeState.reason ?? 'Codex runtime is not available in the Box.',
-          'codex_app_server_binary_missing',
-        );
-      }
-      const appServerConfig = sandboxProvider.getDefaultCodexAppServerConfig();
-      const hostTokenClient = HostTokenServiceClient.fromEnv();
-      const hostTokens = await hostTokenClient.refresh({ sessionId, reason: 'unauthorized' });
-      const acceptedAt = new Date().toISOString();
-      const hostTokenRuntime = {
-        sessionId,
-        url: hostTokenClient.getBaseUrl(),
-        apiKey: hostTokenClient.getApiKey(),
-      };
 
-      const threadId = session.appServerThreadId;
-      await ensureCodexAppServerDaemon(
-        sandboxProvider,
-        sessionId,
-        appServerConfig,
-        workspaceRoot,
-        hostTokenRuntime,
-      );
-      const messages = [createTurnStartMessage(threadId, input.requestText, workspaceRoot)];
+        const sandboxProvider = getSandboxProvider();
+        const daemonHealth = await getCodexAppServerDaemonHealth(sandboxProvider, sessionId);
+        if (!daemonHealth) {
+          await repository.updateSession(sessionId, {
+            status: 'ready',
+            appServerStatus: 'stopped',
+            daemonStatus: 'stopped',
+            appServerThreadId: null,
+            continuityState: 'continuity_lost',
+            resumeEligibility: 'restart_required',
+            recoveryOutcome: 'none',
+            lastFailureCode: 'codex_daemon_unreachable',
+          });
+          await persistTransportSnapshot(sessionId, markAiSessionTransportLost(sessionId, 'codex_daemon_unreachable', 'Codex daemon is not reachable for this AI session.'));
+          supervisor.updateRuntime(sessionId, {
+            daemonStatus: 'stopped',
+            continuityState: 'continuity_lost',
+            resumeEligibility: 'restart_required',
+            threadId: null,
+            lastFailureCode: 'codex_daemon_unreachable',
+          });
+          await persistTransportSnapshot(sessionId, syncAiSessionTransportThreadId(sessionId, null));
+          throw new AiSessionTransportNotInitializedError('Codex daemon is not reachable for this AI session. Restart the session.');
+        }
 
-      await repository.appendEvent({
-        sessionId,
-        type: 'message.dispatched_to_daemon',
-        payload: {
-          mode: input.mode,
-          threadId,
-          workspaceVersion: executionWorkspaceVersion,
+        const runtimeState = await sandboxProvider.ensureCodexRuntime();
+        if (!runtimeState.ready) {
+          await repository.updateSession(sessionId, {
+            status: 'ready',
+            appServerStatus: 'failed',
+            daemonStatus: 'degraded',
+            appServerThreadId: null,
+            continuityState: 'failed',
+            resumeEligibility: 'restart_required',
+            recoveryOutcome: 'none',
+            lastFailureCode: 'codex_app_server_binary_missing',
+          });
+          await persistTransportSnapshot(sessionId, markAiSessionTransportLost(
+            sessionId,
+            'codex_app_server_binary_missing',
+            runtimeState.reason ?? 'Codex runtime is not available in the Box.',
+          ));
+          supervisor.updateRuntime(sessionId, {
+            daemonStatus: 'degraded',
+            continuityState: 'failed',
+            resumeEligibility: 'restart_required',
+            threadId: null,
+            lastFailureCode: 'codex_app_server_binary_missing',
+          });
+          throw new AiSessionTransportNotImplementedError(
+            runtimeState.reason ?? 'Codex runtime is not available in the Box.',
+            'codex_app_server_binary_missing',
+          );
+        }
+        const appServerConfig = sandboxProvider.getDefaultCodexAppServerConfig();
+        const hostTokenClient = HostTokenServiceClient.fromEnv();
+        const hostTokens = await hostTokenClient.refresh({ sessionId, reason: 'unauthorized' });
+        const acceptedAt = new Date().toISOString();
+        const hostTokenRuntime = {
+          sessionId,
+          url: hostTokenClient.getBaseUrl(),
+          apiKey: hostTokenClient.getApiKey(),
+        };
+
+        const threadId = session.appServerThreadId;
+        await ensureCodexAppServerDaemon(
+          sandboxProvider,
+          sessionId,
+          appServerConfig,
           workspaceRoot,
-          baseTargetId,
-        },
-      });
+          hostTokenRuntime,
+        );
+        const messages = [createTurnStartMessage(threadId, input.requestText, workspaceRoot)];
 
-      for (const message of messages) {
-        appendAiSessionTransportLog(sessionId, 'turn', 'outbound', message);
-      }
+        await repository.appendEvent({
+          sessionId,
+          type: 'message.dispatched_to_daemon',
+          payload: {
+            mode: input.mode,
+            threadId,
+            workspaceVersion: executionWorkspaceVersion,
+            workspaceRoot,
+            baseTargetId,
+          },
+        });
 
-      const turnResult = await callCodexAppServerDaemon(sandboxProvider, sessionId, {
-        phase: 'turn',
-        messages,
-        stopOnMethods: ['turn/completed'],
-        timeoutMs: 300000,
-      });
+        for (const message of messages) {
+          await appendTransportLog(sessionId, 'turn', 'outbound', message);
+        }
 
-      for (const message of turnResult.messages) {
-        appendAiSessionTransportLog(sessionId, 'turn', 'inbound', message);
-      }
+        const turnResult = await callCodexAppServerDaemon(sandboxProvider, sessionId, {
+          phase: 'turn',
+          messages,
+          stopOnMethods: ['turn/completed'],
+          timeoutMs: 300000,
+        });
 
-      const protocolError = findJsonRpcError(turnResult.messages);
-      const turnStatus = findTurnCompletedStatus(turnResult.messages);
-      const agentText = collectAgentMessageText(turnResult.messages);
-      if (!turnResult.ok || protocolError || !turnStatus || turnStatus === 'interrupted') {
+        for (const message of turnResult.messages) {
+          await appendTransportLog(sessionId, 'turn', 'inbound', message);
+        }
+
+        const protocolError = findJsonRpcError(turnResult.messages);
+        const turnStatus = findTurnCompletedStatus(turnResult.messages);
+        const agentText = collectAgentMessageText(turnResult.messages);
+        if (!turnResult.ok || protocolError || !turnStatus || turnStatus === 'interrupted') {
+          await repository.updateSession(sessionId, {
+            status: 'ready',
+            appServerStatus: 'degraded',
+            daemonStatus: 'degraded',
+            appServerThreadId: null,
+            continuityState: 'continuity_lost',
+            resumeEligibility: 'restart_required',
+            recoveryOutcome: 'none',
+            lastFailureCode: 'codex_app_server_turn_failed',
+          });
+          await persistTransportSnapshot(sessionId, markAiSessionTransportLost(
+            sessionId,
+            'codex_app_server_turn_failed',
+            protocolError ?? turnResult.error ?? `Codex app-server turn did not complete successfully (${turnStatus ?? 'unknown'}).`,
+          ));
+          supervisor.updateRuntime(sessionId, {
+            daemonStatus: 'degraded',
+            continuityState: 'continuity_lost',
+            resumeEligibility: 'restart_required',
+            threadId: null,
+            lastFailureCode: 'codex_app_server_turn_failed',
+          });
+          throw new AiSessionTransportNotImplementedError(
+            protocolError ?? turnResult.error ?? `Codex app-server turn did not complete successfully (${turnStatus ?? 'unknown'}).`,
+            'codex_app_server_turn_failed',
+          );
+        }
+
         await repository.updateSession(sessionId, {
           status: 'ready',
-          appServerStatus: 'degraded',
-          daemonStatus: 'degraded',
-          appServerThreadId: null,
-          continuityState: 'continuity_lost',
-          resumeEligibility: 'restart_required',
-          lastFailureCode: 'codex_app_server_turn_failed',
+          appServerStatus: 'healthy',
+          daemonStatus: 'healthy',
+          threadMaterializedAt: session.threadMaterializedAt ?? acceptedAt,
+          continuityState: session.threadMaterializedAt ? 'resumable' : 'first_turn_materialized',
+          resumeEligibility: 'resumable',
+          lastSupervisorHeartbeatAt: new Date().toISOString(),
+          lastFailureCode: null,
         });
-        markAiSessionTransportLost(
-          sessionId,
-          'codex_app_server_turn_failed',
-          protocolError ?? turnResult.error ?? `Codex app-server turn did not complete successfully (${turnStatus ?? 'unknown'}).`,
-        );
         supervisor.updateRuntime(sessionId, {
-          daemonStatus: 'degraded',
-          continuityState: 'continuity_lost',
-          resumeEligibility: 'restart_required',
-          threadId: null,
-          lastFailureCode: 'codex_app_server_turn_failed',
+          daemonStatus: 'healthy',
+          continuityState: session.threadMaterializedAt ? 'resumable' : 'first_turn_materialized',
+          resumeEligibility: 'resumable',
+          threadId,
+          threadMaterializedAt: session.threadMaterializedAt ?? acceptedAt,
+          lastFailureCode: null,
         });
-        throw new AiSessionTransportNotImplementedError(
-          protocolError ?? turnResult.error ?? `Codex app-server turn did not complete successfully (${turnStatus ?? 'unknown'}).`,
-          'codex_app_server_turn_failed',
-        );
-      }
+        await persistTransportSnapshot(sessionId, finishAiSessionTransportTurn(sessionId));
+        await repository.appendEvent({
+          sessionId,
+          type: 'message.turn_completed',
+          payload: {
+            threadId,
+            turnStatus,
+            agentText,
+            workspaceVersion: executionWorkspaceVersion,
+            workspaceRoot,
+            baseTargetId,
+            recoveryOutcome: session.recoveryOutcome,
+          },
+        });
 
-      await repository.updateSession(sessionId, {
-        status: 'ready',
-        appServerStatus: 'healthy',
-        daemonStatus: 'healthy',
-        threadMaterializedAt: session.threadMaterializedAt ?? acceptedAt,
-        continuityState: session.threadMaterializedAt ? 'resumable' : 'first_turn_materialized',
-        resumeEligibility: 'resumable',
-        lastSupervisorHeartbeatAt: new Date().toISOString(),
-        lastFailureCode: null,
-      });
-      supervisor.updateRuntime(sessionId, {
-        daemonStatus: 'healthy',
-        continuityState: session.threadMaterializedAt ? 'resumable' : 'first_turn_materialized',
-        resumeEligibility: 'resumable',
-        threadId,
-        threadMaterializedAt: session.threadMaterializedAt ?? acceptedAt,
-        lastFailureCode: null,
-      });
-      finishAiSessionTransportTurn(sessionId);
-      await repository.appendEvent({
-        sessionId,
-        type: 'message.turn_completed',
-        payload: {
+        return {
+          acknowledged: true,
+          sessionId,
+          acceptedAt,
           threadId,
           turnStatus,
           agentText,
           workspaceVersion: executionWorkspaceVersion,
           workspaceRoot,
           baseTargetId,
-        },
-      });
-
-      return {
-        acknowledged: true,
-        sessionId,
-        acceptedAt,
-        threadId,
-        turnStatus,
-        agentText,
-        workspaceVersion: executionWorkspaceVersion,
-        workspaceRoot,
-        baseTargetId,
-      };
+        };
+      } catch (error) {
+        const alreadyHandled =
+          error instanceof AiSessionTransportNotInitializedError ||
+          error instanceof AiSessionTransportNotImplementedError ||
+          error instanceof AiSessionMessageNotReadyError;
+        if (!alreadyHandled) {
+          await repository.updateSession(sessionId, {
+            status: 'ready',
+            appServerStatus: 'degraded',
+            daemonStatus: 'degraded',
+            appServerThreadId: null,
+            continuityState: 'continuity_lost',
+            resumeEligibility: 'restart_required',
+            recoveryOutcome: 'none',
+            lastFailureCode: 'codex_turn_unexpected_error',
+          });
+          await persistTransportSnapshot(
+            sessionId,
+            markAiSessionTransportLost(
+              sessionId,
+              'codex_turn_unexpected_error',
+              error instanceof Error ? error.message : 'Unexpected error during Codex turn execution.',
+            ),
+          );
+          supervisor.updateRuntime(sessionId, {
+            daemonStatus: 'degraded',
+            continuityState: 'continuity_lost',
+            resumeEligibility: 'restart_required',
+            threadId: null,
+            lastFailureCode: 'codex_turn_unexpected_error',
+          });
+          await persistTransportSnapshot(sessionId, syncAiSessionTransportThreadId(sessionId, null));
+        }
+        throw error;
+      }
     },
 
     async promoteWorkspaceVersion(sessionId: string, workspaceVersion: number) {

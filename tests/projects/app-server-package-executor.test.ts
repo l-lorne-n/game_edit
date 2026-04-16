@@ -182,8 +182,245 @@ describe('runAppServerPackageExecutor', () => {
 
     expect(result.actualEngine).toBe('codex-app-server');
     expect(result.fallbackReason).toBeNull();
+    expect(result.requiresReinit).toBe(false);
     expect(aiSessionService.readWorkspacePackage).toHaveBeenCalledWith('sess-1', 2);
     expect(aiSessionService.promoteWorkspaceVersion).toHaveBeenCalledWith('sess-1', 2);
+  });
+
+  it('retries transient workspace readback failures', async () => {
+    const pkg = {
+      indexHtml: '<html></html>',
+      gameJs: 'console.log(1);',
+      styleCss: 'body {}',
+      manifestJson: '{"title":"Demo","summary":"Demo","capabilities":[]}',
+    };
+    const aiSessionService = {
+      getSession: vi.fn().mockResolvedValue({
+        id: 'sess-1',
+        projectId: 'project-1',
+        baseVersion: 3,
+        activeWorkspaceVersion: 1,
+        latestWorkspaceVersion: 1,
+        revokedAt: null,
+        status: 'ready',
+        appServerStatus: 'healthy',
+      }),
+      getTransportSnapshot: vi.fn().mockResolvedValue({ phase: 'ready' }),
+      executeMessage: vi.fn().mockResolvedValue({
+        acknowledged: true,
+        sessionId: 'sess-1',
+        acceptedAt: new Date().toISOString(),
+        threadId: 'thr-1',
+        turnStatus: 'completed',
+        agentText: 'done',
+        workspaceVersion: 1,
+        workspaceRoot: '/workspace/home/sessions/sess-1/v1',
+        baseTargetId: null,
+      }),
+      readWorkspacePackage: vi
+        .fn()
+        .mockResolvedValueOnce(pkg)
+        .mockRejectedValueOnce(new Error('fetch failed'))
+        .mockResolvedValueOnce(pkg),
+      writeWorkspacePackage: vi.fn(),
+      promoteWorkspaceVersion: vi.fn().mockResolvedValue(undefined),
+    };
+    const projectService = {
+      getProject: vi.fn().mockResolvedValue({ id: 'project-1', ownerId: 'owner-1', currentVersion: 3 }),
+    };
+
+    createAiSessionServiceMock.mockReturnValue(aiSessionService);
+    createProjectServiceMock.mockReturnValue(projectService);
+
+    const result = await runAppServerPackageExecutor({
+      mode: 'create',
+      projectId: 'project-1',
+      aiSessionId: 'sess-1',
+      prompt: 'make game',
+    });
+
+    expect(aiSessionService.readWorkspacePackage).toHaveBeenCalledTimes(3);
+    expect(result.requiresReinit).toBe(false);
+    expect(result.solveResult.pkg.gameJs).toContain('console.log');
+  });
+
+  it('recovers create result from workspace when execution response is lost late', async () => {
+    const preExecutionPkg = {
+      indexHtml: '',
+      gameJs: '',
+      styleCss: '',
+      manifestJson: '',
+    };
+    const recoveredPkg = {
+      indexHtml: '<html></html>',
+      gameJs: 'console.log(1);',
+      styleCss: 'body {}',
+      manifestJson: '{"title":"Demo","summary":"Demo","capabilities":[]}',
+    };
+    const aiSessionService = {
+      getSession: vi
+        .fn()
+        .mockResolvedValueOnce({
+          id: 'sess-1',
+          projectId: 'project-1',
+          baseVersion: 3,
+          activeWorkspaceVersion: 1,
+          latestWorkspaceVersion: 1,
+          revokedAt: null,
+          status: 'ready',
+          appServerStatus: 'healthy',
+        })
+        .mockResolvedValueOnce({
+          id: 'sess-1',
+          projectId: 'project-1',
+          baseVersion: 3,
+          activeWorkspaceVersion: 1,
+          latestWorkspaceVersion: 1,
+          revokedAt: null,
+          status: 'ready',
+          appServerStatus: 'degraded',
+      }),
+      getTransportSnapshot: vi.fn().mockResolvedValue({ phase: 'ready' }),
+      executeMessage: vi.fn().mockRejectedValue(new Error('fetch failed')),
+      readWorkspacePackage: vi
+        .fn()
+        .mockResolvedValueOnce(preExecutionPkg)
+        .mockResolvedValueOnce(recoveredPkg),
+      writeWorkspacePackage: vi.fn(),
+      promoteWorkspaceVersion: vi.fn().mockResolvedValue(undefined),
+    };
+    const projectService = {
+      getProject: vi.fn().mockResolvedValue({ id: 'project-1', ownerId: 'owner-1', currentVersion: 3 }),
+    };
+
+    createAiSessionServiceMock.mockReturnValue(aiSessionService);
+    createProjectServiceMock.mockReturnValue(projectService);
+
+    const result = await runAppServerPackageExecutor({
+      mode: 'create',
+      projectId: 'project-1',
+      aiSessionId: 'sess-1',
+      prompt: 'make game',
+    });
+
+    expect(result.fallbackReason).toBe('workspace_recovered_after_transport_error');
+    expect(result.solveResult.fallbackUsed).toBe(true);
+    expect(result.requiresReinit).toBe(true);
+    expect(result.solveResult.statusMessage).toContain('re-initialize the AI session before the next turn');
+    expect(aiSessionService.readWorkspacePackage).toHaveBeenCalledWith('sess-1', 1);
+  });
+
+  it('does not recover stale unchanged workspace as a successful create', async () => {
+    const stalePkg = {
+      indexHtml: '<html></html>',
+      gameJs: 'console.log(1);',
+      styleCss: 'body {}',
+      manifestJson: '{"title":"Demo","summary":"Demo","capabilities":[]}',
+    };
+    const aiSessionService = {
+      getSession: vi
+        .fn()
+        .mockResolvedValueOnce({
+          id: 'sess-1',
+          projectId: 'project-1',
+          baseVersion: 3,
+          activeWorkspaceVersion: 1,
+          latestWorkspaceVersion: 1,
+          revokedAt: null,
+          status: 'ready',
+          appServerStatus: 'healthy',
+        })
+        .mockResolvedValueOnce({
+          id: 'sess-1',
+          projectId: 'project-1',
+          baseVersion: 3,
+          activeWorkspaceVersion: 1,
+          latestWorkspaceVersion: 1,
+          revokedAt: null,
+          status: 'ready',
+          appServerStatus: 'degraded',
+        }),
+      getTransportSnapshot: vi.fn().mockResolvedValue({ phase: 'ready' }),
+      executeMessage: vi.fn().mockRejectedValue(new Error('fetch failed')),
+      readWorkspacePackage: vi
+        .fn()
+        .mockResolvedValueOnce(stalePkg)
+        .mockResolvedValueOnce(stalePkg),
+      writeWorkspacePackage: vi.fn(),
+      promoteWorkspaceVersion: vi.fn().mockResolvedValue(undefined),
+    };
+    const projectService = {
+      getProject: vi.fn().mockResolvedValue({ id: 'project-1', ownerId: 'owner-1', currentVersion: 3 }),
+    };
+
+    createAiSessionServiceMock.mockReturnValue(aiSessionService);
+    createProjectServiceMock.mockReturnValue(projectService);
+
+    await expect(
+      runAppServerPackageExecutor({
+        mode: 'create',
+        projectId: 'project-1',
+        aiSessionId: 'sess-1',
+        prompt: 'make game',
+      }),
+    ).rejects.toThrow('fetch failed');
+  });
+
+  it('does not recover when baseline workspace snapshot could not be read', async () => {
+    const recoveredPkg = {
+      indexHtml: '<html></html>',
+      gameJs: 'console.log(1);',
+      styleCss: 'body {}',
+      manifestJson: '{"title":"Demo","summary":"Demo","capabilities":[]}',
+    };
+    const aiSessionService = {
+      getSession: vi
+        .fn()
+        .mockResolvedValueOnce({
+          id: 'sess-1',
+          projectId: 'project-1',
+          baseVersion: 3,
+          activeWorkspaceVersion: 1,
+          latestWorkspaceVersion: 1,
+          revokedAt: null,
+          status: 'ready',
+          appServerStatus: 'healthy',
+        })
+        .mockResolvedValueOnce({
+          id: 'sess-1',
+          projectId: 'project-1',
+          baseVersion: 3,
+          activeWorkspaceVersion: 1,
+          latestWorkspaceVersion: 1,
+          revokedAt: null,
+          status: 'ready',
+          appServerStatus: 'degraded',
+        }),
+      getTransportSnapshot: vi.fn().mockResolvedValue({ phase: 'ready' }),
+      executeMessage: vi.fn().mockRejectedValue(new Error('fetch failed')),
+      readWorkspacePackage: vi
+        .fn()
+        .mockRejectedValueOnce(new Error('fetch failed'))
+        .mockRejectedValueOnce(new Error('fetch failed'))
+        .mockResolvedValueOnce(recoveredPkg),
+      writeWorkspacePackage: vi.fn(),
+      promoteWorkspaceVersion: vi.fn().mockResolvedValue(undefined),
+    };
+    const projectService = {
+      getProject: vi.fn().mockResolvedValue({ id: 'project-1', ownerId: 'owner-1', currentVersion: 3 }),
+    };
+
+    createAiSessionServiceMock.mockReturnValue(aiSessionService);
+    createProjectServiceMock.mockReturnValue(projectService);
+
+    await expect(
+      runAppServerPackageExecutor({
+        mode: 'create',
+        projectId: 'project-1',
+        aiSessionId: 'sess-1',
+        prompt: 'make game',
+      }),
+    ).rejects.toThrow('fetch failed');
   });
 
   it('recovers package files from agent text when workspace files remain empty', async () => {
@@ -241,6 +478,7 @@ describe('runAppServerPackageExecutor', () => {
 
     expect(aiSessionService.writeWorkspacePackage).toHaveBeenCalledWith('sess-1', recoveredPkg, 2);
     expect(aiSessionService.promoteWorkspaceVersion).toHaveBeenCalledWith('sess-1', 2);
+    expect(result.requiresReinit).toBe(false);
     expect(result.solveResult.pkg.indexHtml).toBe('<main>hi</main>');
   });
 });

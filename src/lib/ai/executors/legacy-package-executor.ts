@@ -14,6 +14,7 @@ export async function runLegacyPackageExecutor(input: PackageExecutorInput): Pro
       solveResult: await generatePackageFromPrompt(input.prompt, input.lastKnownGoodPackage),
       actualEngine: 'legacy-model',
       fallbackReason: null,
+      requiresReinit: false,
     };
   }
 
@@ -32,6 +33,7 @@ export async function runLegacyPackageExecutor(input: PackageExecutorInput): Pro
       }),
       actualEngine: 'legacy-model',
       fallbackReason: null,
+      requiresReinit: false,
     };
   }
 
@@ -51,5 +53,6 @@ export async function runLegacyPackageExecutor(input: PackageExecutorInput): Pro
     }),
     actualEngine: 'legacy-model',
     fallbackReason: null,
+    requiresReinit: false,
   };
 }

@@ -5,6 +5,7 @@ import { and, asc, eq, sql } from 'drizzle-orm';
 import {
   aiSessionCheckpoints,
   aiSessionEvents,
+  aiSessionTransportLogs,
   aiSessions,
   getDb,
 } from '@/lib/db';
@@ -16,6 +17,9 @@ import type {
   AiSessionRecord,
   AiSessionRepository,
   AiSessionResumeEligibility,
+  AiSessionTransportLogDirection,
+  AiSessionTransportLogEntry,
+  AiSessionTransportLogPhase,
   CreateAiSessionCheckpointInput,
   CreateAiSessionEventInput,
   UpdateAiSessionInput,
@@ -102,8 +106,15 @@ async function ensureAiSessionSchema(): Promise<void> {
       await db.execute(sql`alter table ai_sessions add column if not exists codex_home_key text`);
       await db.execute(sql`alter table ai_sessions add column if not exists daemon_status text not null default 'stopped'`);
       await db.execute(sql`alter table ai_sessions add column if not exists thread_materialized_at timestamptz`);
+      await db.execute(sql`alter table ai_sessions add column if not exists transport_phase text not null default 'uninitialized'`);
+      await db.execute(sql`alter table ai_sessions add column if not exists transport_initialized_at timestamptz`);
+      await db.execute(sql`alter table ai_sessions add column if not exists transport_last_activity_at timestamptz`);
+      await db.execute(sql`alter table ai_sessions add column if not exists transport_idle_deadline_at timestamptz`);
+      await db.execute(sql`alter table ai_sessions add column if not exists transport_last_error_code text`);
+      await db.execute(sql`alter table ai_sessions add column if not exists transport_last_error_message text`);
       await db.execute(sql`alter table ai_sessions add column if not exists continuity_state text not null default 'new'`);
       await db.execute(sql`alter table ai_sessions add column if not exists resume_eligibility text not null default 'not_resumable'`);
+      await db.execute(sql`alter table ai_sessions add column if not exists recovery_outcome text not null default 'none'`);
       await db.execute(sql`alter table ai_sessions add column if not exists supervisor_instance_id text`);
       await db.execute(sql`alter table ai_sessions add column if not exists supervisor_lease_epoch integer not null default 0`);
       await db.execute(sql`alter table ai_sessions add column if not exists last_supervisor_heartbeat_at timestamptz`);
@@ -130,6 +141,17 @@ async function ensureAiSessionSchema(): Promise<void> {
           updated_at timestamptz not null default now()
         )
       `);
+      await db.execute(sql`
+        create table if not exists ai_session_transport_logs (
+          id text primary key,
+          session_id text not null references ai_sessions(id) on delete cascade,
+          phase text not null,
+          direction text not null,
+          message text not null,
+          created_at timestamptz not null
+        )
+      `);
+      await db.execute(sql`create index if not exists ai_session_transport_logs_session_created_idx on ai_session_transport_logs(session_id, created_at)`);
     })();
   }
 
@@ -154,8 +176,15 @@ function toSessionRecord(input: typeof aiSessions.$inferSelect): AiSessionRecord
     daemonStatus: input.daemonStatus as AiSessionDaemonState,
     appServerThreadId: input.appServerThreadId,
     threadMaterializedAt: input.threadMaterializedAt?.toISOString() ?? null,
+    transportPhase: input.transportPhase as AiSessionRecord['transportPhase'],
+    transportInitializedAt: input.transportInitializedAt?.toISOString() ?? null,
+    transportLastActivityAt: input.transportLastActivityAt?.toISOString() ?? null,
+    transportIdleDeadlineAt: input.transportIdleDeadlineAt?.toISOString() ?? null,
+    transportLastErrorCode: input.transportLastErrorCode,
+    transportLastErrorMessage: input.transportLastErrorMessage,
     continuityState: input.continuityState as AiSessionContinuityState,
     resumeEligibility: input.resumeEligibility as AiSessionResumeEligibility,
+    recoveryOutcome: input.recoveryOutcome as AiSessionRecord['recoveryOutcome'],
     supervisorInstanceId: input.supervisorInstanceId,
     supervisorLeaseEpoch: input.supervisorLeaseEpoch,
     lastSupervisorHeartbeatAt: input.lastSupervisorHeartbeatAt?.toISOString() ?? null,
@@ -216,8 +245,15 @@ export class DrizzleAiSessionRepository implements AiSessionRepository {
         daemonStatus: input.daemonStatus,
         appServerThreadId: input.appServerThreadId,
         threadMaterializedAt: input.threadMaterializedAt ? new Date(input.threadMaterializedAt) : null,
+        transportPhase: input.transportPhase,
+        transportInitializedAt: input.transportInitializedAt ? new Date(input.transportInitializedAt) : null,
+        transportLastActivityAt: input.transportLastActivityAt ? new Date(input.transportLastActivityAt) : null,
+        transportIdleDeadlineAt: input.transportIdleDeadlineAt ? new Date(input.transportIdleDeadlineAt) : null,
+        transportLastErrorCode: input.transportLastErrorCode,
+        transportLastErrorMessage: input.transportLastErrorMessage,
         continuityState: input.continuityState,
         resumeEligibility: input.resumeEligibility,
+        recoveryOutcome: input.recoveryOutcome,
         supervisorInstanceId: input.supervisorInstanceId,
         supervisorLeaseEpoch: input.supervisorLeaseEpoch,
         lastSupervisorHeartbeatAt: input.lastSupervisorHeartbeatAt ? new Date(input.lastSupervisorHeartbeatAt) : null,
@@ -271,8 +307,15 @@ export class DrizzleAiSessionRepository implements AiSessionRepository {
         ...('daemonStatus' in input ? { daemonStatus: input.daemonStatus } : {}),
         ...('appServerThreadId' in input ? { appServerThreadId: input.appServerThreadId ?? null } : {}),
         ...('threadMaterializedAt' in input ? { threadMaterializedAt: input.threadMaterializedAt ? new Date(input.threadMaterializedAt) : null } : {}),
+        ...('transportPhase' in input ? { transportPhase: input.transportPhase ?? 'uninitialized' } : {}),
+        ...('transportInitializedAt' in input ? { transportInitializedAt: input.transportInitializedAt ? new Date(input.transportInitializedAt) : null } : {}),
+        ...('transportLastActivityAt' in input ? { transportLastActivityAt: input.transportLastActivityAt ? new Date(input.transportLastActivityAt) : null } : {}),
+        ...('transportIdleDeadlineAt' in input ? { transportIdleDeadlineAt: input.transportIdleDeadlineAt ? new Date(input.transportIdleDeadlineAt) : null } : {}),
+        ...('transportLastErrorCode' in input ? { transportLastErrorCode: input.transportLastErrorCode ?? null } : {}),
+        ...('transportLastErrorMessage' in input ? { transportLastErrorMessage: input.transportLastErrorMessage ?? null } : {}),
         ...('continuityState' in input ? { continuityState: input.continuityState } : {}),
         ...('resumeEligibility' in input ? { resumeEligibility: input.resumeEligibility } : {}),
+        ...('recoveryOutcome' in input ? { recoveryOutcome: input.recoveryOutcome ?? 'none' } : {}),
         ...('supervisorInstanceId' in input ? { supervisorInstanceId: input.supervisorInstanceId ?? null } : {}),
         ...('supervisorLeaseEpoch' in input ? { supervisorLeaseEpoch: input.supervisorLeaseEpoch ?? 0 } : {}),
         ...('lastSupervisorHeartbeatAt' in input ? { lastSupervisorHeartbeatAt: input.lastSupervisorHeartbeatAt ? new Date(input.lastSupervisorHeartbeatAt) : null } : {}),
@@ -324,6 +367,33 @@ export class DrizzleAiSessionRepository implements AiSessionRepository {
       .orderBy(asc(aiSessionEvents.createdAt));
 
     return rows.map(toEventRecord);
+  }
+
+  async appendTransportLog(sessionId: string, entry: AiSessionTransportLogEntry): Promise<AiSessionTransportLogEntry> {
+    await ensureAiSessionSchema();
+    const db = getDb();
+    await db.insert(aiSessionTransportLogs).values({
+      id: entry.id,
+      sessionId,
+      phase: entry.phase,
+      direction: entry.direction,
+      message: entry.message,
+      createdAt: new Date(entry.createdAt),
+    });
+    return structuredClone(entry);
+  }
+
+  async listTransportLogs(sessionId: string): Promise<AiSessionTransportLogEntry[]> {
+    await ensureAiSessionSchema();
+    const db = getDb();
+    const rows = await db.select().from(aiSessionTransportLogs).where(eq(aiSessionTransportLogs.sessionId, sessionId)).orderBy(asc(aiSessionTransportLogs.createdAt));
+    return rows.map(row => ({
+      id: row.id,
+      phase: row.phase as AiSessionTransportLogPhase,
+      direction: row.direction as AiSessionTransportLogDirection,
+      message: row.message,
+      createdAt: row.createdAt.toISOString(),
+    }));
   }
 
   async findCheckpointByIdempotencyKey(sessionId: string, idempotencyKey: string): Promise<AiSessionCheckpointRecord | null> {

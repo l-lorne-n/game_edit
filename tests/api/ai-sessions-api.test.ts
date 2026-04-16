@@ -8,6 +8,8 @@ const mockAiSessionService = {
   initializeTransport: vi.fn(),
   listProjectSessions: vi.fn(),
   listEvents: vi.fn(),
+  listWorkspaceVersions: vi.fn(),
+  getWorkspaceVersionPayload: vi.fn(),
   bootstrapSession: vi.fn(),
   executeMessage: vi.fn(),
   checkpointSession: vi.fn(),
@@ -41,6 +43,7 @@ vi.mock('@/lib/projects/service', () => ({
 describe('ai sessions api routes', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockAiSessionService.listWorkspaceVersions.mockResolvedValue([]);
     mockAiSessionService.getTransportSnapshot.mockResolvedValue({
       phase: 'uninitialized',
       threadId: null,
@@ -265,6 +268,50 @@ describe('ai sessions api routes', () => {
     const body = await response.text();
     expect(body).toContain('session.snapshot');
     expect(body).toContain('session.ready');
+  });
+
+  it('lists Box workspace versions for an ai session', async () => {
+    mockAiSessionService.getSession.mockResolvedValue({ id: 'sess-1', status: 'ready' });
+    mockAiSessionService.listWorkspaceVersions.mockResolvedValue([
+      { versionId: 'session:v1', workspaceVersion: 1, createdAt: new Date().toISOString(), isActive: false, isLatest: false, sourceTargetId: null },
+      { versionId: 'session:v2', workspaceVersion: 2, createdAt: new Date().toISOString(), isActive: true, isLatest: true, sourceTargetId: 'session:v1' },
+    ]);
+
+    const { GET } = await import('@/app/api/ai/sessions/[id]/versions/route');
+    const response = await GET(new Request('http://localhost/api/ai/sessions/sess-1/versions'), {
+      params: Promise.resolve({ id: 'sess-1' }),
+    });
+    const data = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(data.versions).toHaveLength(2);
+    expect(data.versions[1].versionId).toBe('session:v2');
+  });
+
+  it('loads a specific Box workspace version payload', async () => {
+    mockAiSessionService.getSession.mockResolvedValue({ id: 'sess-1', status: 'ready' });
+    mockAiSessionService.getWorkspaceVersionPayload.mockResolvedValue({
+      versionId: 'session:v1',
+      workspaceVersion: 1,
+      package: {
+        indexHtml: '<html></html>',
+        gameJs: 'console.log(1);',
+        styleCss: 'body {}',
+        manifestJson: '{"title":"Demo","summary":"Demo","capabilities":[]}',
+      },
+      isActive: false,
+      isLatest: false,
+    });
+
+    const { GET } = await import('@/app/api/ai/sessions/[id]/versions/[versionId]/route');
+    const response = await GET(new Request('http://localhost/api/ai/sessions/sess-1/versions/session:v1'), {
+      params: Promise.resolve({ id: 'sess-1', versionId: 'session:v1' }),
+    });
+    const data = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(data.versionId).toBe('session:v1');
+    expect(data.package.gameJs).toContain('console.log');
   });
 
   it('checkpoints an ai session', async () => {

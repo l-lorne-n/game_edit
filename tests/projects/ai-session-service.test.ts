@@ -1,12 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { AiSessionConflictError, AiSessionTransportNotInitializedError, createAiSessionService } from '@/lib/ai-sessions/service';
-import { resetAiSessionSupervisor } from '@/lib/ai-sessions/supervisor';
+import { getAiSessionSupervisor, resetAiSessionSupervisor } from '@/lib/ai-sessions/supervisor';
+import { markAiSessionTransportReady, startAiSessionTransportInit } from '@/lib/ai-sessions/transport-runtime';
 import type {
   AiSessionCheckpointRecord,
   AiSessionEventRecord,
   AiSessionRecord,
   AiSessionRepository,
+  AiSessionTransportLogEntry,
   CreateAiSessionCheckpointInput,
   CreateAiSessionEventInput,
   UpdateAiSessionInput,
@@ -16,6 +18,7 @@ class InMemoryAiSessionRepository implements AiSessionRepository {
   private readonly sessions = new Map<string, AiSessionRecord>();
   private readonly events: AiSessionEventRecord[] = [];
   private readonly checkpoints: AiSessionCheckpointRecord[] = [];
+  private readonly transportLogs: Array<{ sessionId: string; entry: AiSessionTransportLogEntry }> = [];
 
   async createSession(input: AiSessionRecord): Promise<AiSessionRecord> {
     this.sessions.set(input.id, structuredClone(input));
@@ -59,6 +62,15 @@ class InMemoryAiSessionRepository implements AiSessionRepository {
 
   async listEvents(sessionId: string): Promise<AiSessionEventRecord[]> {
     return this.events.filter(event => event.sessionId === sessionId).map(event => structuredClone(event));
+  }
+
+  async appendTransportLog(_sessionId: string, entry: AiSessionTransportLogEntry): Promise<AiSessionTransportLogEntry> {
+    this.transportLogs.push({ sessionId: _sessionId, entry });
+    return structuredClone(entry);
+  }
+
+  async listTransportLogs(sessionId: string): Promise<AiSessionTransportLogEntry[]> {
+    return this.transportLogs.filter(item => item.sessionId === sessionId).map(item => structuredClone(item.entry));
   }
 
   async findCheckpointByIdempotencyKey(sessionId: string, idempotencyKey: string): Promise<AiSessionCheckpointRecord | null> {
@@ -203,5 +215,61 @@ describe('ai session service', () => {
         requestText: 'make a game',
       }),
     ).rejects.toBeInstanceOf(AiSessionTransportNotInitializedError);
+  });
+
+  it('does not mark healthy in-memory continuity as same-thread recovery', async () => {
+    const service = createAiSessionService(repository);
+    const session = await repository.createSession({
+      id: 'sess-healthy',
+      projectId: 'project-healthy',
+      ownerId: 'owner-1',
+      baseVersion: 1,
+      activeWorkspaceVersion: 1,
+      latestWorkspaceVersion: 1,
+      status: 'ready',
+      authMode: 'chatgptAuthTokens',
+      authState: 'ready',
+      boxId: 'box-1',
+      codexHomeKey: 'sessions/sess-healthy',
+      boxStatus: 'ready',
+      appServerStatus: 'healthy',
+      daemonStatus: 'healthy',
+      appServerThreadId: 'thr-healthy',
+      threadMaterializedAt: new Date().toISOString(),
+      transportPhase: 'ready',
+      transportInitializedAt: new Date().toISOString(),
+      transportLastActivityAt: new Date().toISOString(),
+      transportIdleDeadlineAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+      transportLastErrorCode: null,
+      transportLastErrorMessage: null,
+      continuityState: 'resumable',
+      resumeEligibility: 'resumable',
+      recoveryOutcome: 'none',
+      supervisorInstanceId: null,
+      supervisorLeaseEpoch: 0,
+      lastSupervisorHeartbeatAt: null,
+      lastFailureCode: null,
+      currentLeaseToken: 'lease-healthy',
+      leaseHeartbeatAt: new Date().toISOString(),
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      lastCheckpointVersion: null,
+      lastCheckpointId: null,
+      revokedAt: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    startAiSessionTransportInit(session.id);
+    markAiSessionTransportReady(session.id, 'thr-healthy');
+    const runtime = getAiSessionSupervisor().beginRuntime(session);
+    await repository.updateSession(session.id, {
+      supervisorInstanceId: runtime.supervisorInstanceId,
+      supervisorLeaseEpoch: runtime.supervisorLeaseEpoch,
+      lastSupervisorHeartbeatAt: runtime.lastHeartbeatAt,
+    });
+
+    const result = await service.initializeTransport(session.id, null);
+
+    expect(result.session.recoveryOutcome).toBe('none');
   });
 });

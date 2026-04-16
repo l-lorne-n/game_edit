@@ -655,12 +655,18 @@ export default function CodegenAppShell() {
       return;
     }
 
+    setAiSessionVersions([]);
+    setViewedAiSessionVersion(null);
+    setViewedAiSessionVersionId('');
+
     let cancelled = false;
     async function fetchVersions() {
       try {
         const versions = await listAiSessionVersions(activeAiSessionId!);
         if (!cancelled) {
           setAiSessionVersions(versions);
+          setViewedAiSessionVersionId(currentId => (currentId && !versions.some(version => version.versionId === currentId) ? '' : currentId));
+          setViewedAiSessionVersion(current => (current && !versions.some(version => version.versionId === current.versionId) ? null : current));
         }
       } catch {
         // ignore
@@ -1559,6 +1565,7 @@ export default function CodegenAppShell() {
                         boxStatus: activeAiSessionSnapshot.session.boxStatus,
                         appServerStatus: activeAiSessionSnapshot.session.appServerStatus,
                         transportPhase: activeAiSessionSnapshot.transport?.phase ?? 'uninitialized',
+                        recoveryOutcome: activeAiSessionSnapshot.session.recoveryOutcome,
                         lastCheckpointVersion: activeAiSessionSnapshot.session.lastCheckpointVersion,
                         recentEvents: activeAiSessionSnapshot.events.map(event => event.type),
                       },
