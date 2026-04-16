@@ -1,6 +1,8 @@
 import { z } from 'zod';
 
-export const packageCapabilitySchema = z.enum(['audio', 'fullscreen', 'pointerLock']);
+export const PACKAGE_CAPABILITY_VALUES = ['audio', 'fullscreen', 'pointerLock'] as const;
+
+export const packageCapabilitySchema = z.enum(PACKAGE_CAPABILITY_VALUES);
 
 export const packageManifestSchema = z.object({
   title: z.string().min(1).max(80),
