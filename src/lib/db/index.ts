@@ -28,6 +28,13 @@ export function resetDbForTests() {
 export const dbSchema = schema;
 export const projects = schema.projects;
 export const projectVersions = schema.projectVersions;
+export const aiSessions = schema.aiSessions;
+export const aiSessionEvents = schema.aiSessionEvents;
+export const aiSessionCheckpoints = schema.aiSessionCheckpoints;
+export const hostAuthPendingStates = schema.hostAuthPendingStates;
+export const hostBrowserAuthAttempts = schema.hostBrowserAuthAttempts;
+export const hostAuthSessions = schema.hostAuthSessions;
+export const hostAuthBindings = schema.hostAuthBindings;
 
 export type {
   Project,
@@ -35,4 +42,25 @@ export type {
   ProjectVersion,
   NewProjectVersion,
   ProjectVersionSource,
+  AiSession,
+  NewAiSession,
+  AiSessionEvent,
+  NewAiSessionEvent,
+  AiSessionCheckpoint,
+  NewAiSessionCheckpoint,
+  HostAuthPendingState,
+  NewHostAuthPendingState,
+  HostBrowserAuthAttempt,
+  NewHostBrowserAuthAttempt,
+  HostAuthSession,
+  NewHostAuthSession,
+  HostAuthBinding,
+  NewHostAuthBinding,
+  AiSessionState,
+  AiSessionAuthMode,
+  AiSessionAuthState,
+  AiSessionBoxState,
+  AiSessionAppServerState,
+  AiSessionCheckpointState,
+  HostBrowserAuthAttemptStatus,
 } from './schema-pg';

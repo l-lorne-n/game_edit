@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { getInfraReadiness, getStorageProviderName } from '@/lib/config/infra';
+import { getInfraReadiness, getSandboxProviderName, getStorageProviderName } from '@/lib/config/infra';
 
 const ORIGINAL_ENV = { ...process.env };
 
@@ -31,5 +31,19 @@ describe('storage provider config', () => {
 
     expect(getStorageProviderName()).toBe('local');
     expect(getInfraReadiness().storage.provider).toBe('local');
+  });
+
+  it('reports host token service readiness independently', () => {
+    process.env.HOST_TOKEN_SERVICE_URL = 'http://localhost:8787';
+
+    expect(getInfraReadiness().hostTokenService.configured).toBe(true);
+  });
+
+  it('prefers upstash box provider when configured', () => {
+    process.env.UPSTASH_BOX_API_KEY = 'box-key';
+    process.env.UPSTASH_BOX_NAME = 'box-name';
+
+    expect(getSandboxProviderName()).toBe('upstash-box');
+    expect(getInfraReadiness().sandbox.provider).toBe('upstash-box');
   });
 });

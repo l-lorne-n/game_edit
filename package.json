@@ -20,6 +20,7 @@
   "dependencies": {
     "@ai-sdk/openai": "^3.0.41",
     "@neondatabase/serverless": "^1.0.2",
+    "@upstash/box": "^0.1.32",
     "@vercel/blob": "^2.3.3",
     "ai": "^6.0.116",
     "drizzle-orm": "^0.45.2",
