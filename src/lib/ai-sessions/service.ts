@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { HostTokenServiceClient } from '@/lib/host-tokens/client';
 import {
   appendAiSessionTransportLog,
+  appendAiSessionTransportLogs,
   clearAiSessionTransport,
   expireAiSessionTransportIfIdle,
   getAiSessionTransportSnapshot,
@@ -20,6 +21,7 @@ import { getAiSessionSupervisor } from '@/lib/ai-sessions/supervisor';
 import {
   callCodexAppServerDaemon,
   ensureCodexAppServerDaemon,
+  getCodexAppServerDaemonTurnMessages,
   getCodexAppServerDaemonTurnResult,
   getCodexAppServerDaemonTurnStatus,
   getCodexAppServerDaemonHealth,
@@ -394,6 +396,53 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
     return entry;
   }
 
+  async function appendTransportLogs(
+    sessionId: string,
+    phase: 'init' | 'turn',
+    direction: 'outbound' | 'inbound' | 'system',
+    messages: unknown[],
+    options?: { idForMessage?: (message: unknown, index: number) => string },
+  ) {
+    if (messages.length === 0) {
+      return [];
+    }
+
+    const entries = appendAiSessionTransportLogs(
+      sessionId,
+      messages.map((message, index) => ({
+        id: options?.idForMessage?.(message, index),
+        phase,
+        direction,
+        message,
+      })),
+    );
+    await repository.appendTransportLogs(sessionId, entries);
+    const session = await repository.getSession(sessionId);
+    const lastEntry = entries[entries.length - 1];
+    if (session && lastEntry) {
+      await repository.updateSession(sessionId, {
+        transportLastActivityAt: lastEntry.createdAt,
+        transportIdleDeadlineAt: session.transportPhase !== 'initializing'
+          ? new Date(new Date(lastEntry.createdAt).getTime() + 10 * 60 * 1000).toISOString()
+          : null,
+      });
+    }
+    return entries;
+  }
+
+  function shouldPersistInboundTurnTransportLogMessage(message: Record<string, unknown>) {
+    const method = typeof message.method === 'string' ? message.method : null;
+    if (!method) {
+      return true;
+    }
+
+    if (method.endsWith('/delta') || method.endsWith('/chunk')) {
+      return false;
+    }
+
+    return true;
+  }
+
   async function rehydrateTransportRuntime(session: AiSessionRecord) {
     if (hasAiSessionTransportRuntime(session.id)) {
       return getAiSessionTransportSnapshot(session);
@@ -431,7 +480,6 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
 
   function buildTurnExecutionEngine(turn: AiSessionTurnRecord) {
     const diagnostics = turn.diagnostics ?? {};
-    const messages = Array.isArray(turn.resultPayload?.daemonMessages) ? turn.resultPayload.daemonMessages : [];
     const outcome: ExecutionOutcome =
       turn.finalOutcome === 'failed'
         ? 'hard_failure'
@@ -494,7 +542,6 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
         }),
       ],
       failureContext,
-      daemonMessages: messages,
     };
   }
 
@@ -534,16 +581,20 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
   }
 
   async function appendTurnInboundMessagesOnce(turn: AiSessionTurnRecord, messages: Record<string, unknown>[]) {
-    const diagnostics = turn.diagnostics ?? {};
+    const latestTurn = await repository.getTurn(turn.id);
+    const persistedTurn = latestTurn ?? turn;
+    const diagnostics = persistedTurn.diagnostics ?? {};
     if (diagnostics.transportLogsPersistedAt) {
-      return turn;
+      return persistedTurn;
     }
 
-    for (const message of messages) {
-      await appendTransportLog(turn.sessionId, 'turn', 'inbound', message);
-    }
+    const retainedMessages = messages.filter(shouldPersistInboundTurnTransportLogMessage);
 
-    return repository.updateTurn(turn.id, {
+    await appendTransportLogs(persistedTurn.sessionId, 'turn', 'inbound', retainedMessages, {
+      idForMessage: (_message, index) => `${persistedTurn.id}:inbound:${index}`,
+    });
+
+    return repository.updateTurn(persistedTurn.id, {
       diagnostics: {
         ...diagnostics,
         transportLogsPersistedAt: new Date().toISOString(),
@@ -571,11 +622,6 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
           ...updatedTurn.diagnostics,
           durableArtifactPending: true,
           artifactReadError: error instanceof Error ? error.message : String(error),
-          daemonMessages: messages,
-        },
-        resultPayload: {
-          ...updatedTurn.resultPayload,
-          daemonMessages: messages,
         },
       });
     }
@@ -623,7 +669,6 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
       diagnostics: {
         ...updatedTurn.diagnostics,
         durableArtifactPending: false,
-        daemonMessages: messages,
       },
       resultPayload: {
         ...updatedTurn.resultPayload,
@@ -639,7 +684,6 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
         provider: 'openai',
         model: 'codex-app-server',
         attempts: [],
-        daemonMessages: messages,
       },
     });
 
@@ -730,7 +774,6 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
                 ...updatedTurn.diagnostics,
                 recoveredFromFailureCode: failureCode,
                 recoveredFromFailureMessage: failureMessage,
-                daemonMessages: messages,
               },
               resultPayload: {
                 ...updatedTurn.resultPayload,
@@ -744,7 +787,6 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
                 provider: 'openai',
                 model: 'codex-app-server',
                 attempts: [],
-                daemonMessages: messages,
               },
             });
             const latestSession = await repository.getSession(updatedTurn.sessionId);
@@ -792,11 +834,6 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
       failureMessage,
       diagnostics: {
         ...updatedTurn.diagnostics,
-        daemonMessages: messages,
-      },
-      resultPayload: {
-        ...updatedTurn.resultPayload,
-        daemonMessages: messages,
       },
     });
 
@@ -865,6 +902,9 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
       return updatedTurn;
     }
 
+    const messages =
+      (await getCodexAppServerDaemonTurnMessages(sandboxProvider, turn.sessionId, turn.id).catch(() => [])) ?? [];
+
     updatedTurn = await repository.updateTurn(turn.id, {
       threadId: daemonResult.state.threadId ?? turn.threadId,
       startedAt: daemonResult.startedAt,
@@ -873,10 +913,9 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
         ...turn.diagnostics,
         daemonPhase: daemonResult.phase,
         daemonState: daemonResult.state,
-      },
+        },
     });
 
-    const messages = daemonResult.messages ?? [];
     if (daemonResult.phase === 'failed') {
       const structuredFailure = getStructuredTransportFailureFromMessages(messages);
       return finalizeFailedTurn(
@@ -1898,6 +1937,10 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
       return toCompletedTurnResult(syncedTurn);
     },
 
+    /**
+     * @deprecated Production callers should use submitMessageTurn() + getMessageTurnResult().
+     * Retained only as a thin compatibility wrapper around the async turn path.
+     */
     async executeMessage(sessionId: string, input: ExecuteMessageInput): Promise<{
       acknowledged: true;
       sessionId: string;

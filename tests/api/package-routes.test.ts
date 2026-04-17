@@ -113,6 +113,37 @@ describe('package api routes', () => {
     expect(response.status).toBe(202);
     expect(data.ok).toBe(true);
     expect(data.accepted).toBe(true);
+    expect(Object.keys(data).sort()).toEqual([
+      'accepted',
+      'asyncTurn',
+      'executionEngine',
+      'fallbackUsed',
+      'model',
+      'ok',
+      'persistenceWarning',
+      'project',
+      'provider',
+      'repaired',
+      'requiresReinit',
+      'requiresReplan',
+      'serverRouteDecision',
+      'source',
+      'statusMessage',
+    ].sort());
+    expect(Object.keys(data.asyncTurn).sort()).toEqual([
+      'acceptedAt',
+      'acknowledged',
+      'artifactState',
+      'baseTargetId',
+      'deduplicated',
+      'sessionId',
+      'status',
+      'threadId',
+      'turnId',
+      'workspaceRoot',
+      'workspaceVersion',
+    ].sort());
+    expect(data.executionEngine.outcome).toBe('pending');
     expect(mockAiSessionService.submitMessageTurn).toHaveBeenCalled();
     expect(runCodexPackageTaskMock).not.toHaveBeenCalled();
     expect(mockProjectService.saveGeneratedPackage).not.toHaveBeenCalled();
@@ -132,7 +163,67 @@ describe('package api routes', () => {
     expect(data.ok).toBe(true);
     expect(data.accepted).toBe(true);
     expect(data.project).toBeNull();
+    expect(Object.keys(data.asyncTurn).sort()).toEqual([
+      'acceptedAt',
+      'acknowledged',
+      'artifactState',
+      'baseTargetId',
+      'deduplicated',
+      'sessionId',
+      'status',
+      'threadId',
+      'turnId',
+      'workspaceRoot',
+      'workspaceVersion',
+    ].sort());
     expect(mockAiSessionService.submitMessageTurn).toHaveBeenCalled();
     expect(mockProjectService.saveGeneratedPackage).not.toHaveBeenCalled();
+  });
+
+  it('returns the current async acceptance contract for ai-session debug', async () => {
+    const { POST } = await import('@/app/api/package/debug/route');
+    const response = await POST(
+      new Request('http://localhost/api/package/debug', {
+        method: 'POST',
+        body: JSON.stringify({
+          errorReport: 'player falls through the floor',
+          projectId: 'p1',
+          aiSessionId: 'sess-1',
+          targetId: '__current__',
+          currentPackage: {
+            indexHtml: '<html></html>',
+            gameJs: 'console.log(1);',
+            styleCss: 'body {}',
+            manifestJson: '{"title":"Demo","summary":"Demo","capabilities":[]}',
+          },
+        }),
+      }),
+    );
+    const data = await response.json();
+
+    expect(response.status).toBe(202);
+    expect(data.ok).toBe(true);
+    expect(data.accepted).toBe(true);
+    expect(data.requiresReinit).toBe(false);
+    expect(Object.keys(data).sort()).toEqual([
+      'accepted',
+      'asyncTurn',
+      'executionEngine',
+      'fallbackUsed',
+      'model',
+      'ok',
+      'persistenceWarning',
+      'project',
+      'provider',
+      'repaired',
+      'requiresReinit',
+      'serverRouteDecision',
+      'source',
+      'statusMessage',
+    ].sort());
+    expect(data.executionEngine.strategy).toBe('repair_execute');
+    expect(data.asyncTurn.status).toBe('running');
+    expect(mockAiSessionService.submitMessageTurn).toHaveBeenCalled();
+    expect(runCodexPackageTaskMock).not.toHaveBeenCalled();
   });
 });

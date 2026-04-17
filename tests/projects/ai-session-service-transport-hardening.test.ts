@@ -26,6 +26,7 @@ const {
   submitTurnMock,
   getTurnStatusMock,
   getTurnResultMock,
+  getTurnMessagesMock,
 } = vi.hoisted(() => ({
   sandboxProviderMock: {
     getReadiness: vi.fn(),
@@ -44,6 +45,7 @@ const {
   submitTurnMock: vi.fn(),
   getTurnStatusMock: vi.fn(),
   getTurnResultMock: vi.fn(),
+  getTurnMessagesMock: vi.fn(),
 }));
 
 vi.mock('@/lib/sandbox', () => ({
@@ -75,6 +77,7 @@ vi.mock('@/lib/ai-sessions/app-server-daemon', () => ({
   submitCodexAppServerDaemonTurn: submitTurnMock,
   getCodexAppServerDaemonTurnStatus: getTurnStatusMock,
   getCodexAppServerDaemonTurnResult: getTurnResultMock,
+  getCodexAppServerDaemonTurnMessages: getTurnMessagesMock,
 }));
 
 import { AiSessionTransportNotImplementedError, createAiSessionService } from '@/lib/ai-sessions/service';
@@ -133,6 +136,15 @@ class InMemoryAiSessionRepository implements AiSessionRepository {
   async appendTransportLog(sessionId: string, entry: AiSessionTransportLogEntry): Promise<AiSessionTransportLogEntry> {
     this.transportLogs.push({ sessionId, entry });
     return structuredClone(entry);
+  }
+
+  async appendTransportLogs(sessionId: string, entries: AiSessionTransportLogEntry[]): Promise<AiSessionTransportLogEntry[]> {
+    for (const entry of entries) {
+      if (!this.transportLogs.some(item => item.sessionId === sessionId && item.entry.id === entry.id)) {
+        this.transportLogs.push({ sessionId, entry });
+      }
+    }
+    return entries.map(entry => structuredClone(entry));
   }
 
   async listTransportLogs(sessionId: string): Promise<AiSessionTransportLogEntry[]> {
@@ -331,7 +343,6 @@ describe('ai session service transport hardening', () => {
         code: null,
         error: null,
         turnStatus: null,
-        messages: [],
         state: {
           initialized: true,
           threadId: 'thr-1',
@@ -342,6 +353,7 @@ describe('ai session service transport hardening', () => {
     }));
     getTurnStatusMock.mockResolvedValue(null);
     getTurnResultMock.mockResolvedValue(null);
+    getTurnMessagesMock.mockResolvedValue([]);
   });
 
   afterEach(() => {
@@ -361,7 +373,6 @@ describe('ai session service transport hardening', () => {
       code: null,
       error: null,
       turnStatus: null,
-      messages: [],
       state: {
         initialized: true,
         threadId: 'thr-1',
@@ -388,6 +399,8 @@ describe('ai session service transport hardening', () => {
   it('gates result completion on durable workspace artifacts and preserves terminal diagnostics', async () => {
     const service = createAiSessionService(repository);
     await createReadySession(repository, 'sess-durable-gating');
+    const appendTransportLogsSpy = vi.spyOn(repository, 'appendTransportLogs');
+    const singleInsertCallsBeforeFinalize = vi.spyOn(repository, 'appendTransportLog');
 
     const submitted = await service.submitMessageTurn('sess-durable-gating', {
       mode: 'create',
@@ -403,10 +416,6 @@ describe('ai session service transport hardening', () => {
       code: null,
       error: null,
       turnStatus: 'completed',
-      messages: [
-        { method: 'item/agentMessage/delta', params: { delta: 'done' } },
-        { method: 'turn/completed', params: { turn: { status: 'completed' } } },
-      ],
       state: {
         initialized: true,
         threadId: 'thr-1',
@@ -423,10 +432,6 @@ describe('ai session service transport hardening', () => {
       code: null,
       error: null,
       turnStatus: 'completed',
-      messages: [
-        { method: 'item/agentMessage/delta', params: { delta: 'done' } },
-        { method: 'turn/completed', params: { turn: { status: 'completed' } } },
-      ],
       state: {
         initialized: true,
         threadId: 'thr-1',
@@ -434,7 +439,13 @@ describe('ai session service transport hardening', () => {
         appServerPid: 123,
       },
     });
+    getTurnMessagesMock.mockResolvedValue([
+      { method: 'item/agentMessage/delta', params: { delta: 'done' } },
+      { method: 'item/agentMessage/chunk', params: { chunk: '...' } },
+      { method: 'turn/completed', params: { turn: { status: 'completed' } } },
+    ]);
     sandboxProviderMock.readFile.mockRejectedValueOnce(new Error('fetch failed other side closed'));
+    const singleInsertCountBeforeFinalize = singleInsertCallsBeforeFinalize.mock.calls.length;
 
     const status = await service.getMessageTurnStatus('sess-durable-gating', submitted.turnId);
 
@@ -447,9 +458,78 @@ describe('ai session service transport hardening', () => {
     expect(result.artifactState).not.toBe('pending');
     expect(result.agentText).toBe('done');
     expect(['completed', 'failed']).toContain(result.finalOutcome);
+    expect(result.executionEngine).not.toBeNull();
+    expect(result.executionEngine && 'daemonMessages' in result.executionEngine).toBe(false);
 
     const persistedTurn = await repository.getTurn(submitted.turnId);
+    const persistedLogs = await repository.listTransportLogs(submitted.sessionId);
+    const inboundTurnLogs = persistedLogs.filter(entry => entry.phase === 'turn' && entry.direction === 'inbound');
+
+    expect(appendTransportLogsSpy).toHaveBeenCalledTimes(1);
+    expect(appendTransportLogsSpy.mock.calls[0]?.[1]).toHaveLength(1);
+    expect(inboundTurnLogs).toHaveLength(1);
+    expect(inboundTurnLogs[0]?.message).toContain('turn/completed');
+    expect(singleInsertCallsBeforeFinalize.mock.calls.length).toBe(singleInsertCountBeforeFinalize);
     expect(persistedTurn?.diagnostics.transportLogsPersistedAt).toBeTruthy();
+    expect(persistedTurn?.resultPayload.daemonMessages).toBeUndefined();
+  });
+
+  it('deduplicates inbound finalize log persistence across concurrent status/result polls', async () => {
+    const service = createAiSessionService(repository);
+    await createReadySession(repository, 'sess-finalize-race');
+
+    const submitted = await service.submitMessageTurn('sess-finalize-race', {
+      mode: 'create',
+      requestText: 'make a maze game',
+    });
+
+    getTurnStatusMock.mockResolvedValue({
+      turnId: submitted.turnId,
+      phase: 'completed',
+      submittedAt: submitted.acceptedAt,
+      startedAt: submitted.acceptedAt,
+      completedAt: new Date().toISOString(),
+      code: null,
+      error: null,
+      turnStatus: 'completed',
+      state: {
+        initialized: true,
+        threadId: 'thr-1',
+        materialized: true,
+        appServerPid: 123,
+      },
+    });
+    getTurnResultMock.mockResolvedValue({
+      turnId: submitted.turnId,
+      phase: 'completed',
+      submittedAt: submitted.acceptedAt,
+      startedAt: submitted.acceptedAt,
+      completedAt: new Date().toISOString(),
+      code: null,
+      error: null,
+      turnStatus: 'completed',
+      state: {
+        initialized: true,
+        threadId: 'thr-1',
+        materialized: true,
+        appServerPid: 123,
+      },
+    });
+    getTurnMessagesMock.mockResolvedValue([
+      { method: 'item/agentMessage/delta', params: { delta: 'done' } },
+      { method: 'turn/completed', params: { turn: { status: 'completed' } } },
+    ]);
+
+    await Promise.all([
+      service.getMessageTurnStatus('sess-finalize-race', submitted.turnId),
+      service.getMessageTurnResult('sess-finalize-race', submitted.turnId),
+    ]);
+
+    const persistedLogs = await repository.listTransportLogs(submitted.sessionId);
+    const inboundTurnLogs = persistedLogs.filter(entry => entry.phase === 'turn' && entry.direction === 'inbound');
+
+    expect(inboundTurnLogs).toHaveLength(1);
+    expect(new Set(inboundTurnLogs.map(entry => entry.id)).size).toBe(1);
   });
 
   it('preserves daemon execute timeout classification through executeMessage', async () => {
@@ -465,7 +545,6 @@ describe('ai session service transport hardening', () => {
       code: 'daemon_execute_timeout',
       error: 'Daemon timed out waiting for expected notifications.',
       turnStatus: null,
-      messages: [],
       state: {
         initialized: true,
         threadId: 'thr-1',
@@ -482,7 +561,6 @@ describe('ai session service transport hardening', () => {
       code: 'daemon_execute_timeout',
       error: 'Daemon timed out waiting for expected notifications.',
       turnStatus: null,
-      messages: [],
       state: {
         initialized: true,
         threadId: 'thr-1',
@@ -518,15 +596,6 @@ describe('ai session service transport hardening', () => {
       completedAt: new Date().toISOString(),
       code: 'daemon_external_token_refresh_failed',
       error: 'Host token refresh failed',
-      messages: [
-        {
-          id: 7,
-          error: {
-            message: 'Host token refresh failed',
-            data: { code: 'daemon_external_token_refresh_failed' },
-          },
-        },
-      ],
       state: {
         initialized: true,
         threadId: 'thr-1',
@@ -543,15 +612,6 @@ describe('ai session service transport hardening', () => {
       code: 'daemon_external_token_refresh_failed',
       error: 'Host token refresh failed',
       turnStatus: null,
-      messages: [
-        {
-          id: 7,
-          error: {
-            message: 'Host token refresh failed',
-            data: { code: 'daemon_external_token_refresh_failed' },
-          },
-        },
-      ],
       state: {
         initialized: true,
         threadId: 'thr-1',
@@ -559,6 +619,15 @@ describe('ai session service transport hardening', () => {
         appServerPid: 123,
       },
     });
+    getTurnMessagesMock.mockResolvedValue([
+      {
+        id: 7,
+        error: {
+          message: 'Host token refresh failed',
+          data: { code: 'daemon_external_token_refresh_failed' },
+        },
+      },
+    ]);
 
     const rejection = service.executeMessage('sess-refresh-failure', {
       mode: 'create',

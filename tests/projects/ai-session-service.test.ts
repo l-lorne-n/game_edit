@@ -73,6 +73,15 @@ class InMemoryAiSessionRepository implements AiSessionRepository {
     return structuredClone(entry);
   }
 
+  async appendTransportLogs(sessionId: string, entries: AiSessionTransportLogEntry[]): Promise<AiSessionTransportLogEntry[]> {
+    for (const entry of entries) {
+      if (!this.transportLogs.some(item => item.sessionId === sessionId && item.entry.id === entry.id)) {
+        this.transportLogs.push({ sessionId, entry });
+      }
+    }
+    return entries.map(entry => structuredClone(entry));
+  }
+
   async listTransportLogs(sessionId: string): Promise<AiSessionTransportLogEntry[]> {
     return this.transportLogs.filter(item => item.sessionId === sessionId).map(item => structuredClone(item.entry));
   }

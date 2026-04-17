@@ -30,6 +30,7 @@ import {
   getAiSessionVersionPayload,
   type AiSessionSnapshot,
 } from '@/lib/ai-sessions/client';
+import { createAsyncTurnPollController } from '@/lib/ai-sessions/async-turn-polling';
 import type { AiSessionTransportLogEntry, AiSessionTransportSnapshot, AiSessionWorkspaceVersion, AiSessionWorkspaceVersionPayload } from '@/lib/ai-sessions/types';
 import type { EvaluatorResult } from '@/lib/evaluator/types';
 import type { HostTokenSessionMetadata } from '@/lib/host-tokens/types';
@@ -406,6 +407,10 @@ export default function CodegenAppShell() {
   const activeCodexPanel = activeProject ? codexPanels[activeProject.id] ?? null : null;
   const activeProjectId = activeProject?.id ?? null;
   const activeAiSessionId = activeAiSession?.id ?? null;
+  const activeTurnId = activeProject?.lastExecutionTrace?.turnId ?? null;
+  const activeTurnState = activeProject?.lastExecutionTrace?.turnState ?? null;
+  const activeRouteAgent = activeProject?.lastRouteDecision?.agent ?? null;
+  const activeProjectMode = activeProject?.lastMode ?? null;
 
   const targetOptions = useMemo(() => {
     const options = [
@@ -500,18 +505,19 @@ export default function CodegenAppShell() {
   }, [workspace, workspaceReady]);
 
   useEffect(() => {
-    if (!activeProject || !activeAiSessionId) {
-      return;
-    }
-
-    const activeTurnId = activeProject.lastExecutionTrace?.turnId ?? null;
-    const activeTurnState = activeProject.lastExecutionTrace?.turnState ?? null;
-    if (!activeTurnId || isTerminalAsyncTurnState(activeTurnState)) {
+    if (!activeProjectId || !activeAiSessionId || !activeTurnId || isTerminalAsyncTurnState(activeTurnState)) {
       return;
     }
 
     let cancelled = false;
-    let timeoutId: number | null = null;
+    const generatorLabel = activeRouteAgent ? labelForAgent(activeRouteAgent) : '生成器';
+    const controller = createAsyncTurnPollController({
+      schedule: (callback, delayMs) => window.setTimeout(callback, delayMs),
+      cancel: handle => window.clearTimeout(handle),
+      onPoll: () => {
+        void poll();
+      },
+    });
 
     const poll = async () => {
       try {
@@ -520,9 +526,15 @@ export default function CodegenAppShell() {
           return;
         }
 
+        if (isTerminalAsyncTurnState(status.status)) {
+          await finalizeAsyncTurnRef.current(activeProjectId, activeTurnId);
+          controller.dispose();
+          return;
+        }
+
         setWorkspace(prev =>
           prev
-            ? updateProject(prev, activeProject.id, project => ({
+            ? updateProject(prev, activeProjectId, project => ({
                 ...project,
                 lastExecutionTrace: project.lastExecutionTrace
                   ? {
@@ -538,44 +550,32 @@ export default function CodegenAppShell() {
             : prev,
         );
 
-        if (!isTerminalAsyncTurnState(status.status)) {
-          const generatorLabel = activeProject.lastRouteDecision ? labelForAgent(activeProject.lastRouteDecision.agent) : '生成器';
-          const elapsed = status.acceptedAt ? Math.max(0, Date.now() - Date.parse(status.acceptedAt)) : 0;
-          setPhases([
-            {
-              id: 'generator',
-              label: generatorLabel,
-              state: activeProject.lastMode === 'debug' ? 'repairing' : 'running',
-              detail: `Async turn ${status.status} (artifact: ${status.artifactState})`,
-              elapsedMs: elapsed,
-            },
-            { id: 'tester', label: '测试者', state: 'idle', detail: '等待生成完成', elapsedMs: 0 },
-            { id: 'checker', label: '检查者', state: 'idle', detail: '等待最终结果', elapsedMs: 0 },
-          ]);
-        }
-
-        if (isTerminalAsyncTurnState(status.status)) {
-          await finalizeAsyncTurnRef.current(activeProject.id, activeTurnId);
-          return;
-        }
+        const elapsed = status.acceptedAt ? Math.max(0, Date.now() - Date.parse(status.acceptedAt)) : 0;
+        setPhases([
+          {
+            id: 'generator',
+            label: generatorLabel,
+            state: activeProjectMode === 'debug' ? 'repairing' : 'running',
+            detail: `Async turn ${status.status} (artifact: ${status.artifactState})`,
+            elapsedMs: elapsed,
+          },
+          { id: 'tester', label: '测试者', state: 'idle', detail: '等待生成完成', elapsedMs: 0 },
+          { id: 'checker', label: '检查者', state: 'idle', detail: '等待最终结果', elapsedMs: 0 },
+        ]);
       } catch {
         // keep polling for transient request failures
       }
 
-      timeoutId = window.setTimeout(() => {
-        void poll();
-      }, 1000);
+      controller.scheduleNext();
     };
 
     void poll();
 
     return () => {
       cancelled = true;
-      if (timeoutId !== null) {
-        window.clearTimeout(timeoutId);
-      }
+      controller.dispose();
     };
-  }, [activeAiSessionId, activeProject]);
+  }, [activeAiSessionId, activeProjectId, activeProjectMode, activeRouteAgent, activeTurnId, activeTurnState]);
 
   function mutateActiveProject(updater: (project: GameProject) => GameProject): void {
     if (!activeProject) {

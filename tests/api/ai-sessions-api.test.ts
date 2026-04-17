@@ -408,6 +408,20 @@ describe('ai sessions api routes', () => {
     const data = await response.json();
 
     expect(response.status).toBe(200);
+    expect(data.ok).toBe(true);
+    expect(Object.keys(data.result).sort()).toEqual([
+      'acceptedAt',
+      'acknowledged',
+      'artifactState',
+      'baseTargetId',
+      'deduplicated',
+      'sessionId',
+      'status',
+      'threadId',
+      'turnId',
+      'workspaceRoot',
+      'workspaceVersion',
+    ].sort());
     expect(data.result.turnId).toBe('turn-1');
     expect(mockAiSessionService.submitMessageTurn).toHaveBeenCalledWith('sess-1', expect.objectContaining({ mode: 'modify' }));
   });
@@ -420,7 +434,43 @@ describe('ai sessions api routes', () => {
     const data = await response.json();
 
     expect(response.status).toBe(200);
+    expect(data.ok).toBe(true);
+    expect(Object.keys(data.status).sort()).toEqual([
+      'artifactState',
+      'sessionId',
+      'status',
+      'turnId',
+    ].sort());
     expect(data.status.turnId).toBe('turn-1');
+  });
+
+  it('loads the terminal ai session turn result contract', async () => {
+    const { GET } = await import('@/app/api/ai/sessions/[id]/messages/[turnId]/result/route');
+    const response = await GET(new Request('http://localhost/api/ai/sessions/sess-1/messages/turn-1/result'), {
+      params: Promise.resolve({ id: 'sess-1', turnId: 'turn-1' }),
+    });
+    const data = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(data.ok).toBe(true);
+    expect(Object.keys(data.result).sort()).toEqual([
+      'acceptedAt',
+      'acknowledged',
+      'agentText',
+      'artifactState',
+      'baseTargetId',
+      'failureCode',
+      'failureMessage',
+      'finalOutcome',
+      'recoveryOutcome',
+      'sessionId',
+      'threadId',
+      'turnId',
+      'turnStatus',
+      'workspaceRoot',
+      'workspaceVersion',
+    ].sort());
+    expect(data.result.finalOutcome).toBe('completed');
   });
 
   it('returns 409 when ai session turn result is not ready', async () => {
@@ -432,7 +482,11 @@ describe('ai sessions api routes', () => {
       params: Promise.resolve({ id: 'sess-1', turnId: 'turn-1' }),
     });
 
+    const data = await response.json();
+
     expect(response.status).toBe(409);
+    expect(data.ok).toBe(false);
+    expect(data.code).toBe('message_transport_not_ready');
   });
 
   it('returns 409 when a different active turn already exists', async () => {

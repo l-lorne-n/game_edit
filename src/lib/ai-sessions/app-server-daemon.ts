@@ -40,8 +40,12 @@ export type CodexAppServerDaemonTurnRecord = {
   code: string | null;
   error: string | null;
   turnStatus: string | null;
-  messages: JsonRpcMessage[];
   state: CodexAppServerDaemonResponse['state'];
+};
+
+export type CodexAppServerDaemonTurnMessages = {
+  turnId: string;
+  messages: JsonRpcMessage[];
 };
 
 export type CodexAppServerDaemonTurnSubmitResponse = {
@@ -120,6 +124,14 @@ try { await unlink(configPath); } catch {}
 const turnDir = join(config.cwd, '.codex-turns');
 await mkdir(turnDir, { recursive: true });
 
+function getTurnPath(turnId) {
+  return join(turnDir, turnId + '.json');
+}
+
+function getTurnMessagesPath(turnId) {
+  return join(turnDir, turnId + '.messages.jsonl');
+}
+
 const child = spawn(config.command, config.args, {
   cwd: config.cwd,
   stdio: ['pipe', 'pipe', 'pipe'],
@@ -177,21 +189,60 @@ function summarizeTurn(turn) {
     code: turn.code ?? null,
     error: turn.error ?? null,
     turnStatus: turn.turnStatus ?? null,
-    messages: Array.isArray(turn.messages) ? turn.messages : [],
     state: turn.state ?? getState(),
   };
 }
 
+function shouldRetainTurnMessage(message) {
+  const method = typeof message?.method === 'string' ? message.method : null;
+  if (!method) {
+    return true;
+  }
+  if (method === 'item/started' || method === 'item/completed') {
+    return false;
+  }
+  return true;
+}
+
+function serializeTurnMessages(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return '';
+  }
+  return messages.map(message => JSON.stringify(message)).join('\n');
+}
+
+async function persistTurnMessages(turn) {
+  const messages = Array.isArray(turn.messages) ? turn.messages.filter(shouldRetainTurnMessage) : [];
+  await writeFile(getTurnMessagesPath(turn.turnId), serializeTurnMessages(messages));
+}
+
 async function persistTurn(turn) {
-  await writeFile(join(turnDir, turn.turnId + '.json'), JSON.stringify(summarizeTurn(turn), null, 2));
+  await persistTurnMessages(turn);
+  await writeFile(getTurnPath(turn.turnId), JSON.stringify(summarizeTurn(turn), null, 2));
 }
 
 async function loadTurn(turnId) {
   try {
-    const rawTurn = await readFile(join(turnDir, turnId + '.json'), 'utf8');
+    const rawTurn = await readFile(getTurnPath(turnId), 'utf8');
     return JSON.parse(rawTurn);
   } catch {
     return null;
+  }
+}
+
+async function loadTurnMessages(turnId) {
+  try {
+    const rawMessages = await readFile(getTurnMessagesPath(turnId), 'utf8');
+    if (!rawMessages.trim()) {
+      return [];
+    }
+    return rawMessages
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(Boolean)
+      .map(line => JSON.parse(line));
+  } catch {
+    return [];
   }
 }
 
@@ -599,6 +650,20 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  const turnMessagesMatch = req.url?.match(/^\/turns\/([^/]+)\/messages$/);
+  if (req.method === 'GET' && turnMessagesMatch) {
+    const turnId = decodeURIComponent(turnMessagesMatch[1]);
+    const turn = await loadTurn(turnId);
+    if (!turn) {
+      res.statusCode = 404;
+      res.end(JSON.stringify({ ok: false, code: 'turn_not_found', error: 'Turn not found.' }));
+      return;
+    }
+    const messages = await loadTurnMessages(turnId);
+    res.end(JSON.stringify({ ok: true, turnId, messages }));
+    return;
+  }
+
   res.statusCode = 404;
   res.end(JSON.stringify({ ok: false, error: 'not found' }));
 });
@@ -754,6 +819,27 @@ export async function getCodexAppServerDaemonTurnResult(
     return null;
   }
   return response.turn;
+}
+
+export async function getCodexAppServerDaemonTurnMessages(
+  sandboxProvider: SandboxProvider,
+  sessionId: string,
+  turnId: string,
+): Promise<JsonRpcMessage[] | null> {
+  const encodedTurnId = encodeURIComponent(turnId);
+  const response = await readDaemonJson<{ ok: boolean; turnId?: string; messages?: JsonRpcMessage[]; code?: string }>(
+    sandboxProvider,
+    `curl -sS http://127.0.0.1:${getAiSessionDaemonPort(sessionId)}/turns/${encodedTurnId}/messages`,
+  ).catch(error => {
+    if (error instanceof CodexAppServerDaemonError && error.code === 'codex_daemon_empty_response') {
+      return { ok: false };
+    }
+    throw error;
+  });
+  if (!response.ok || !('messages' in response) || !Array.isArray(response.messages)) {
+    return null;
+  }
+  return response.messages;
 }
 
 export async function getCodexAppServerDaemonHealth(

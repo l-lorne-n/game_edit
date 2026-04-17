@@ -461,6 +461,27 @@ export class DrizzleAiSessionRepository implements AiSessionRepository {
     return structuredClone(entry);
   }
 
+  async appendTransportLogs(sessionId: string, entries: AiSessionTransportLogEntry[]): Promise<AiSessionTransportLogEntry[]> {
+    if (entries.length === 0) {
+      return [];
+    }
+
+    await ensureAiSessionSchema();
+    const db = getDb();
+    await db
+      .insert(aiSessionTransportLogs)
+      .values(entries.map(entry => ({
+        id: entry.id,
+        sessionId,
+        phase: entry.phase,
+        direction: entry.direction,
+        message: entry.message,
+        createdAt: new Date(entry.createdAt),
+      })))
+      .onConflictDoNothing();
+    return entries.map(entry => structuredClone(entry));
+  }
+
   async listTransportLogs(sessionId: string): Promise<AiSessionTransportLogEntry[]> {
     await ensureAiSessionSchema();
     const db = getDb();

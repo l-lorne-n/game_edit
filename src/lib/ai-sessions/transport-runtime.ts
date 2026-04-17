@@ -24,6 +24,14 @@ type TransportRuntimeRecord = {
   turnTranscript: AiSessionTransportLogEntry[];
 };
 
+type AppendAiSessionTransportLogInput = {
+  id?: string;
+  phase: AiSessionTransportLogPhase;
+  direction: AiSessionTransportLogDirection;
+  message: unknown;
+  createdAt?: string;
+};
+
 export type PersistedTransportRuntimeState = {
   phase: AiSessionTransportPhase;
   threadId: string | null;
@@ -103,6 +111,33 @@ function getOrCreateRecord(sessionId: string): TransportRuntimeRecord {
   const created = createBaseRecord();
   runtimeBySession.set(sessionId, created);
   return created;
+}
+
+function appendEntriesToRecord(record: TransportRuntimeRecord, entries: AiSessionTransportLogEntry[]) {
+  if (entries.length === 0) {
+    return;
+  }
+
+  const existingIds = new Set([...record.initTranscript, ...record.turnTranscript].map(entry => entry.id));
+  const uniqueEntries = entries.filter(entry => !existingIds.has(entry.id));
+  if (uniqueEntries.length === 0) {
+    return;
+  }
+
+  const initEntries = uniqueEntries.filter(entry => entry.phase === 'init');
+  const turnEntries = uniqueEntries.filter(entry => entry.phase === 'turn');
+  if (initEntries.length > 0) {
+    record.initTranscript = trimEntries([...record.initTranscript, ...initEntries]);
+  }
+  if (turnEntries.length > 0) {
+    record.turnTranscript = trimEntries([...record.turnTranscript, ...turnEntries]);
+  }
+
+  const lastEntry = uniqueEntries[uniqueEntries.length - 1];
+  record.lastActivityAt = lastEntry.createdAt;
+  if (record.phase !== 'initializing') {
+    record.idleDeadlineAt = computeIdleDeadline(lastEntry.createdAt);
+  }
 }
 
 function toSnapshot(record: TransportRuntimeRecord): AiSessionTransportSnapshot {
@@ -242,27 +277,23 @@ export function appendAiSessionTransportLog(
   direction: AiSessionTransportLogDirection,
   message: unknown,
 ): AiSessionTransportLogEntry {
+  return appendAiSessionTransportLogs(sessionId, [{ phase, direction, message }])[0];
+}
+
+export function appendAiSessionTransportLogs(
+  sessionId: string,
+  inputs: AppendAiSessionTransportLogInput[],
+): AiSessionTransportLogEntry[] {
   const record = getOrCreateRecord(sessionId);
-  const createdAt = nowIso();
-  const entry: AiSessionTransportLogEntry = {
-    id: randomUUID(),
-    phase,
-    direction,
-    message: sanitizeMessage(message),
-    createdAt,
-  };
-
-  if (phase === 'init') {
-    record.initTranscript = trimEntries([...record.initTranscript, entry]);
-  } else {
-    record.turnTranscript = trimEntries([...record.turnTranscript, entry]);
-  }
-
-  record.lastActivityAt = createdAt;
-  if (record.phase !== 'initializing') {
-    record.idleDeadlineAt = computeIdleDeadline(createdAt);
-  }
-  return entry;
+  const entries = inputs.map(input => ({
+    id: input.id ?? randomUUID(),
+    phase: input.phase,
+    direction: input.direction,
+    message: sanitizeMessage(input.message),
+    createdAt: input.createdAt ?? nowIso(),
+  }));
+  appendEntriesToRecord(record, entries);
+  return entries;
 }
 
 export function clearAiSessionTransport(sessionId: string): void {

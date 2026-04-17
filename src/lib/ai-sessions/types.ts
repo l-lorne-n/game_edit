@@ -281,6 +281,7 @@ export type AiSessionRepository = {
   appendEvent(input: CreateAiSessionEventInput): Promise<AiSessionEventRecord>;
   listEvents(sessionId: string): Promise<AiSessionEventRecord[]>;
   appendTransportLog(sessionId: string, entry: AiSessionTransportLogEntry): Promise<AiSessionTransportLogEntry>;
+  appendTransportLogs(sessionId: string, entries: AiSessionTransportLogEntry[]): Promise<AiSessionTransportLogEntry[]>;
   listTransportLogs(sessionId: string): Promise<AiSessionTransportLogEntry[]>;
   findCheckpointByIdempotencyKey(sessionId: string, idempotencyKey: string): Promise<AiSessionCheckpointRecord | null>;
   createCheckpoint(input: CreateAiSessionCheckpointInput): Promise<AiSessionCheckpointRecord>;

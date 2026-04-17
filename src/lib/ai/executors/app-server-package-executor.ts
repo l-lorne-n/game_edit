@@ -1,4 +1,5 @@
 import {
+  AiSessionMessageNotReadyError,
   AiSessionTransportNotInitializedError,
   createAiSessionService,
 } from '@/lib/ai-sessions/service';
@@ -245,10 +246,23 @@ export async function runAppServerPackageExecutor(input: PackageExecutorInput): 
     }
   }
 
-  let messageResult: Awaited<ReturnType<typeof aiSessionService.executeMessage>>;
+  let messageResult:
+    | {
+        acknowledged: true;
+        sessionId: string;
+        acceptedAt: string;
+        threadId: string;
+        turnStatus: string | null;
+        agentText: string;
+        workspaceVersion: number;
+        workspaceRoot: string;
+        baseTargetId: string | null;
+        turnId: string;
+      }
+    | null = null;
   const transportTurnStartedAt = Date.now();
   try {
-    messageResult = await aiSessionService.executeMessage(session.id, {
+    const submittedTurn = await aiSessionService.submitMessageTurn(session.id, {
       mode: input.mode,
       requestText: buildCodexWorkspacePrompt({
         mode: input.mode,
@@ -266,6 +280,39 @@ export async function runAppServerPackageExecutor(input: PackageExecutorInput): 
       routeReason: input.routeReason ?? null,
       allowedPaths: input.allowedPaths,
     });
+
+    const resultWaitStartedAt = Date.now();
+    while (Date.now() - resultWaitStartedAt < 310000) {
+      try {
+        const result = await aiSessionService.getMessageTurnResult(session.id, submittedTurn.turnId);
+        if (result.finalOutcome === 'failed' || !result.package || !result.manifest || !result.staticEvaluation) {
+          throw new Error(result.failureMessage ?? 'Codex app-server turn failed.');
+        }
+        messageResult = {
+          acknowledged: true,
+          sessionId: result.sessionId,
+          acceptedAt: result.acceptedAt,
+          threadId: result.threadId,
+          turnStatus: result.turnStatus,
+          agentText: result.agentText,
+          workspaceVersion: result.workspaceVersion,
+          workspaceRoot: result.workspaceRoot,
+          baseTargetId: result.baseTargetId,
+          turnId: result.turnId,
+        };
+        break;
+      } catch (error) {
+        if (!(error instanceof AiSessionMessageNotReadyError)) {
+          throw error;
+        }
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+    }
+
+    if (!messageResult) {
+      throw new Error('Timed out waiting for AI session turn completion.');
+    }
+
     executionStages.push(
       createExecutionStage({
         key: 'transport_turn',
