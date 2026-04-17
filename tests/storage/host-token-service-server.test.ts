@@ -23,6 +23,7 @@ describe('host token service server', () => {
 
   afterEach(async () => {
     process.env = { ...ORIGINAL_ENV };
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     if (storageDir) {
       await rm(storageDir, { recursive: true, force: true });
@@ -98,6 +99,8 @@ describe('host token service server', () => {
       accessToken: 'access-1',
       refreshToken: 'refresh-1',
       idToken: 'header.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdC0xIiwiY2hhdGdwdF9wbGFuX3R5cGUiOiJwbHVzIn19.sig',
+      bindToken: 'bind-1',
+      bindTokenExpiresAt: Date.now() + 60_000,
       expiresAt: Date.now() - 10_000,
       accountId: 'acct-1',
       planType: 'plus',
@@ -118,6 +121,40 @@ describe('host token service server', () => {
     expect(result.accountId).toBe('acct-1');
     expect(result.planType).toBe('pro');
     expect(fetchMock).toHaveBeenCalled();
+    const refreshed = await store.getAuthSession('auth-1');
+    expect(refreshed?.bindToken).toBe('bind-1');
+    expect(refreshed?.bindTokenExpiresAt).toBeGreaterThanOrEqual(result.expiresAt);
+  });
+
+  it('aligns bind token lifetime with the initial auth session expiry', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          access_token: 'access-1',
+          refresh_token: 'refresh-1',
+          id_token: 'header.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdC0xIiwiY2hhdGdwdF9wbGFuX3R5cGUiOiJwbHVzIn19.sig',
+          expires_in: 3600,
+        }),
+        { status: 200 },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const store = new FileHostTokenStore(storageDir);
+    await store.init();
+    const service = new HostTokenService(store);
+
+    const started = await service.beginBrowserOAuth();
+    const completed = await service.completeBrowserOAuth({
+      code: 'oauth-code-1',
+      state: started.state,
+    });
+
+    const saved = await store.getAuthSession(completed.sessionId);
+    expect(saved?.bindToken).toBeTruthy();
+    expect(saved?.bindTokenExpiresAt).toBe(saved?.expiresAt);
   });
 
   it('revokes a bound ai session without deleting the underlying auth session', async () => {

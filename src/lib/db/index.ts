@@ -32,6 +32,7 @@ export const aiSessions = schema.aiSessions;
 export const aiSessionEvents = schema.aiSessionEvents;
 export const aiSessionCheckpoints = schema.aiSessionCheckpoints;
 export const aiSessionTransportLogs = schema.aiSessionTransportLogs;
+export const aiSessionTurns = schema.aiSessionTurns;
 export const hostAuthPendingStates = schema.hostAuthPendingStates;
 export const hostBrowserAuthAttempts = schema.hostBrowserAuthAttempts;
 export const hostAuthSessions = schema.hostAuthSessions;
@@ -51,6 +52,8 @@ export type {
   NewAiSessionCheckpoint,
   AiSessionTransportLog,
   NewAiSessionTransportLog,
+  AiSessionTurn,
+  NewAiSessionTurn,
   HostAuthPendingState,
   NewHostAuthPendingState,
   HostBrowserAuthAttempt,

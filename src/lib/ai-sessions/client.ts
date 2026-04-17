@@ -4,11 +4,16 @@ import type {
   AiSessionCheckpointRecord,
   AiSessionEventRecord,
   AiSessionRecord,
+  AiSessionTurnRecord,
   AiSessionTransportLogEntry,
   AiSessionTransportSnapshot,
   AiSessionWorkspaceVersion,
   AiSessionWorkspaceVersionPayload,
 } from '@/lib/ai-sessions/types';
+import type { PackageExecutionTraceMeta } from '@/lib/ai/execution-trace';
+import type { ModelAttempt } from '@/lib/ai/types';
+import type { EvaluatorResult } from '@/lib/evaluator/types';
+import type { GamePackageManifest, GeneratedGamePackage } from '@/lib/package/contracts';
 import type { HostTokenSessionMetadata } from '@/lib/host-tokens/types';
 import type { HydratedProjectRecord } from '@/lib/projects/types';
 
@@ -29,6 +34,68 @@ export type AiSessionSnapshot = {
   session: AiSessionRecord;
   events: AiSessionEventRecord[];
   transport: AiSessionTransportSnapshot | null;
+};
+
+export type AiSessionTurnSubmitResponse = {
+  acknowledged: true;
+  deduplicated: boolean;
+  sessionId: string;
+  turnId: string;
+  acceptedAt: string;
+  threadId: string;
+  workspaceVersion: number;
+  workspaceRoot: string;
+  baseTargetId: string | null;
+  status: AiSessionTurnRecord['status'];
+  artifactState: AiSessionTurnRecord['artifactState'];
+};
+
+export type AiSessionTurnStatusResponse = {
+  turnId: string;
+  sessionId: string;
+  status: AiSessionTurnRecord['status'];
+  artifactState: AiSessionTurnRecord['artifactState'];
+  acceptedAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+  terminalAt: string | null;
+  workspaceVersion: number;
+  workspaceRoot: string;
+  threadId: string | null;
+  turnStatus: string | null;
+  finalOutcome: AiSessionTurnRecord['finalOutcome'];
+  recoveryOutcome: AiSessionTurnRecord['recoveryOutcome'];
+  failureCode: string | null;
+  failureMessage: string | null;
+};
+
+export type AiSessionTurnResultResponse = {
+  acknowledged: true;
+  sessionId: string;
+  turnId: string;
+  acceptedAt: string;
+  threadId: string;
+  turnStatus: string | null;
+  agentText: string;
+  workspaceVersion: number;
+  workspaceRoot: string;
+  baseTargetId: string | null;
+  artifactState: AiSessionTurnRecord['artifactState'];
+  finalOutcome: AiSessionTurnRecord['finalOutcome'];
+  recoveryOutcome: AiSessionTurnRecord['recoveryOutcome'];
+  failureCode: string | null;
+  failureMessage: string | null;
+  package: GeneratedGamePackage | null;
+  manifest: GamePackageManifest | null;
+  staticEvaluation: EvaluatorResult | null;
+  statusMessage: string;
+  executionEngine: PackageExecutionTraceMeta | null;
+  repaired: boolean;
+  fallbackUsed: boolean;
+  source: string;
+  provider: string;
+  model: string;
+  attempts: ModelAttempt[];
 };
 
 export async function listProjectAiSessions(projectId: string): Promise<AiSessionRecord[]> {
@@ -247,4 +314,49 @@ export async function getAiSessionVersionPayload(sessionId: string, versionId: s
     throw new Error(json.error ?? `Failed to load version ${versionId} for AI session ${sessionId}`);
   }
   return json as AiSessionWorkspaceVersionPayload;
+}
+
+export async function submitAiSessionMessageTurn(
+  sessionId: string,
+  input: {
+    mode: 'create' | 'modify' | 'debug';
+    requestText: string;
+    targetId?: string | null;
+    routeMode?: 'design' | 'patch' | 'repair' | null;
+    routeReason?: string | null;
+    allowedPaths?: string[];
+  },
+): Promise<AiSessionTurnSubmitResponse> {
+  const response = await fetch(`/api/ai/sessions/${sessionId}/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  const json = await parseJson<{ ok: boolean; result?: AiSessionTurnSubmitResponse; error?: string; code?: string }>(response);
+  if (!response.ok || !json.ok || !json.result) {
+    throw new AiSessionClientError(json.error ?? `Failed to submit AI session turn for ${sessionId}`, json.code);
+  }
+  return json.result;
+}
+
+export async function getAiSessionMessageTurnStatus(sessionId: string, turnId: string) {
+  const response = await fetch(`/api/ai/sessions/${sessionId}/messages/${encodeURIComponent(turnId)}`, {
+    cache: 'no-store',
+  });
+  const json = await parseJson<{ ok: boolean; status?: AiSessionTurnStatusResponse; error?: string }>(response);
+  if (!response.ok || !json.ok || !json.status) {
+    throw new Error(json.error ?? `Failed to load AI session turn status for ${turnId}`);
+  }
+  return json.status;
+}
+
+export async function getAiSessionMessageTurnResult(sessionId: string, turnId: string) {
+  const response = await fetch(`/api/ai/sessions/${sessionId}/messages/${encodeURIComponent(turnId)}/result`, {
+    cache: 'no-store',
+  });
+  const json = await parseJson<{ ok: boolean; result?: AiSessionTurnResultResponse; error?: string; code?: string }>(response);
+  if (!response.ok || !json.ok || !json.result) {
+    throw new AiSessionClientError(json.error ?? `Failed to load AI session turn result for ${turnId}`, json.code);
+  }
+  return json.result;
 }

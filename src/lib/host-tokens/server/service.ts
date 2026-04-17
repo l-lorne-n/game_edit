@@ -43,6 +43,10 @@ export type BrowserOAuthStart = {
   expiresAt: number;
 };
 
+function getTokenExpiry(tokens: TokenResponse, now = Date.now()): number {
+  return now + (tokens.expires_in ?? 3600) * 1000;
+}
+
 export class HostTokenService {
   constructor(private readonly store: HostTokenStore = new FileHostTokenStore(loadHostTokenServerConfig().storageDir)) {}
 
@@ -108,7 +112,7 @@ export class HostTokenService {
     const tokens = await this.exchangeAuthorizationCode(input.code, pending, config.oauth);
     const session = this.toSession(tokens, undefined, {
       bindToken: randomBytes(24).toString('base64url'),
-      bindTokenExpiresAt: Date.now() + PENDING_STATE_TTL_MS,
+      bindTokenExpiresAt: getTokenExpiry(tokens),
     });
     await this.store.saveAuthSession(session);
     const attempt = await this.store.getBrowserAuthAttempt(pending.authRequestId);
@@ -298,18 +302,21 @@ export class HostTokenService {
     extras?: { bindToken?: string; bindTokenExpiresAt?: number },
   ): HostAuthSession {
     const now = Date.now();
+    const expiresAt = getTokenExpiry(tokens, now);
     const idToken = tokens.id_token ?? previous?.idToken;
     const claims = parseJwtClaims(idToken ?? tokens.access_token);
+    const bindToken = extras?.bindToken ?? previous?.bindToken;
+    const bindTokenExpiresAt = bindToken
+      ? Math.max(extras?.bindTokenExpiresAt ?? 0, previous?.bindTokenExpiresAt ?? 0, expiresAt)
+      : undefined;
     return {
       authSessionId: previous?.authSessionId ?? randomUUID(),
       accessToken: tokens.access_token,
       refreshToken: tokens.refresh_token ?? previous?.refreshToken ?? '',
       ...(idToken ? { idToken } : {}),
-      ...(extras?.bindToken || previous?.bindToken ? { bindToken: extras?.bindToken ?? previous?.bindToken } : {}),
-      ...(extras?.bindTokenExpiresAt || previous?.bindTokenExpiresAt
-        ? { bindTokenExpiresAt: extras?.bindTokenExpiresAt ?? previous?.bindTokenExpiresAt }
-        : {}),
-      expiresAt: now + (tokens.expires_in ?? 3600) * 1000,
+      ...(bindToken ? { bindToken } : {}),
+      ...(bindTokenExpiresAt ? { bindTokenExpiresAt } : {}),
+      expiresAt,
       accountId: extractAccountId(claims) ?? previous?.accountId,
       planType: extractPlanType(claims) ?? previous?.planType ?? null,
       createdAt: previous?.createdAt ?? now,

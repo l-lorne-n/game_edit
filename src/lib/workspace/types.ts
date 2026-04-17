@@ -1,4 +1,5 @@
 import type { ModelAttempt } from '@/lib/ai/types';
+import type { ExecutionOutcome, ExecutionStage, FailureContext, PackageExecutionTraceMeta, RecoveryContext } from '@/lib/ai/execution-trace';
 import type { EvaluatorResult } from '@/lib/evaluator/types';
 import type { GeneratedGamePackage } from '@/lib/package/contracts';
 
@@ -84,6 +85,13 @@ export type ExecutionTrace = {
   endpoint: string;
   targetId: string;
   roleLabel: string;
+  outcome?: ExecutionOutcome;
+  recovery?: RecoveryContext | null;
+  turnId?: string | null;
+  turnState?: string | null;
+  artifactState?: string | null;
+  acceptedAt?: string | null;
+  deduplicated?: boolean;
   statusMessage: string;
   source: string;
   provider: string;
@@ -94,6 +102,9 @@ export type ExecutionTrace = {
   sandboxCode?: string;
   testsRun: string[];
   filesProduced: string[];
+  engine?: PackageExecutionTraceMeta | null;
+  stages: ExecutionStage[];
+  failureContext: FailureContext | null;
   attemptSummaries: Array<{
     mode: string;
     outcome: string;

@@ -8,10 +8,13 @@ import type {
   AiSessionEventRecord,
   AiSessionRecord,
   AiSessionRepository,
+  AiSessionTurnRecord,
   AiSessionTransportLogEntry,
   CreateAiSessionCheckpointInput,
   CreateAiSessionEventInput,
+  CreateAiSessionTurnInput,
   UpdateAiSessionInput,
+  UpdateAiSessionTurnInput,
 } from '@/lib/ai-sessions/types';
 
 class InMemoryAiSessionRepository implements AiSessionRepository {
@@ -19,6 +22,7 @@ class InMemoryAiSessionRepository implements AiSessionRepository {
   private readonly events: AiSessionEventRecord[] = [];
   private readonly checkpoints: AiSessionCheckpointRecord[] = [];
   private readonly transportLogs: Array<{ sessionId: string; entry: AiSessionTransportLogEntry }> = [];
+  private readonly turns = new Map<string, AiSessionTurnRecord>();
 
   async createSession(input: AiSessionRecord): Promise<AiSessionRecord> {
     this.sessions.set(input.id, structuredClone(input));
@@ -92,6 +96,51 @@ class InMemoryAiSessionRepository implements AiSessionRepository {
     };
     this.checkpoints.push(checkpoint);
     return structuredClone(checkpoint);
+  }
+
+  async createTurn(input: CreateAiSessionTurnInput): Promise<AiSessionTurnRecord> {
+    const turn: AiSessionTurnRecord = {
+      ...input,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    this.turns.set(turn.id, turn);
+    return structuredClone(turn);
+  }
+
+  async getTurn(turnId: string): Promise<AiSessionTurnRecord | null> {
+    const turn = this.turns.get(turnId);
+    return turn ? structuredClone(turn) : null;
+  }
+
+  async listSessionTurns(sessionId: string): Promise<AiSessionTurnRecord[]> {
+    return [...this.turns.values()].filter(turn => turn.sessionId === sessionId).map(turn => structuredClone(turn));
+  }
+
+  async findActiveTurn(sessionId: string): Promise<AiSessionTurnRecord | null> {
+    const turns = [...this.turns.values()].filter(turn => turn.sessionId === sessionId);
+    const active = [...turns].reverse().find((turn: AiSessionTurnRecord) => ['submitted', 'running', 'awaiting_artifact'].includes(turn.status));
+    return active ? structuredClone(active) : null;
+  }
+
+  async findTurnByRequestFingerprint(sessionId: string, requestFingerprint: string): Promise<AiSessionTurnRecord | null> {
+    const turns = [...this.turns.values()].filter(turn => turn.sessionId === sessionId && turn.requestFingerprint === requestFingerprint);
+    const found = turns.at(-1) ?? null;
+    return found ? structuredClone(found) : null;
+  }
+
+  async updateTurn(turnId: string, input: UpdateAiSessionTurnInput): Promise<AiSessionTurnRecord> {
+    const current = this.turns.get(turnId);
+    if (!current) {
+      throw new Error(`Missing turn ${turnId}`);
+    }
+    const next: AiSessionTurnRecord = {
+      ...current,
+      ...input,
+      updatedAt: new Date().toISOString(),
+    };
+    this.turns.set(turnId, next);
+    return structuredClone(next);
   }
 }
 

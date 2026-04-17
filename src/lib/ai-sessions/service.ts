@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import { HostTokenServiceClient } from '@/lib/host-tokens/client';
 import {
@@ -20,7 +20,10 @@ import { getAiSessionSupervisor } from '@/lib/ai-sessions/supervisor';
 import {
   callCodexAppServerDaemon,
   ensureCodexAppServerDaemon,
+  getCodexAppServerDaemonTurnResult,
+  getCodexAppServerDaemonTurnStatus,
   getCodexAppServerDaemonHealth,
+  submitCodexAppServerDaemonTurn,
 } from '@/lib/ai-sessions/app-server-daemon';
 import {
   collectAgentMessageText,
@@ -43,6 +46,12 @@ import {
   getAiSessionWorkspaceRoot,
   parseAiSessionVersionTargetId,
 } from '@/lib/ai-sessions/workspace';
+import { recoverPackageFromAgentText } from '@/lib/ai/codex-agent-text-package';
+import type { ModelAttempt } from '@/lib/ai/types';
+import { createExecutionStage, type ExecutionOutcome, type FailureContext, type PackageExecutionTraceMeta } from '@/lib/ai/execution-trace';
+import { evaluatePackageStatic } from '@/lib/evaluator/static';
+import type { EvaluatorResult } from '@/lib/evaluator/types';
+import { parseGeneratedGamePackage, type GamePackageManifest, type GeneratedGamePackage } from '@/lib/package/contracts';
 import { filesToGeneratedPackage, versionFromSnapshotId } from '@/lib/projects/package-files';
 import { createWorkspaceContractFiles } from '@/lib/package/workspace-contract';
 import { CANONICAL_PACKAGE_FILE_PATHS, type CanonicalPackageFilePath } from '@/lib/projects/types';
@@ -54,6 +63,7 @@ import type {
   AiSessionRecord,
   AiSessionRepository,
   AiSessionState,
+  AiSessionTurnRecord,
   CreateAiSessionInput,
   AiSessionTransportSnapshot,
 } from '@/lib/ai-sessions/types';
@@ -111,6 +121,115 @@ export class AiSessionTransportNotInitializedError extends Error {
   }
 }
 
+export class AiSessionTurnConflictError extends Error {
+  readonly code = 'ai_session_turn_conflict';
+
+  constructor(message: string) {
+    super(message);
+  }
+}
+
+type ExecuteMessageInput = {
+  mode: 'create' | 'modify' | 'debug';
+  requestText: string;
+  targetId?: string | null;
+  routeMode?: 'design' | 'patch' | 'repair' | null;
+  routeReason?: string | null;
+  allowedPaths?: string[];
+};
+
+type MessageTurnSubmitResult = {
+  acknowledged: true;
+  deduplicated: boolean;
+  sessionId: string;
+  turnId: string;
+  acceptedAt: string;
+  threadId: string;
+  workspaceVersion: number;
+  workspaceRoot: string;
+  baseTargetId: string | null;
+  status: AiSessionTurnRecord['status'];
+  artifactState: AiSessionTurnRecord['artifactState'];
+};
+
+type MessageTurnResult = {
+  acknowledged: true;
+  sessionId: string;
+  turnId: string;
+  acceptedAt: string;
+  threadId: string;
+  turnStatus: string | null;
+  agentText: string;
+  workspaceVersion: number;
+  workspaceRoot: string;
+  baseTargetId: string | null;
+  artifactState: AiSessionTurnRecord['artifactState'];
+  finalOutcome: AiSessionTurnRecord['finalOutcome'];
+  recoveryOutcome: AiSessionTurnRecord['recoveryOutcome'];
+  failureCode: string | null;
+  failureMessage: string | null;
+  package: GeneratedGamePackage | null;
+  manifest: GamePackageManifest | null;
+  staticEvaluation: EvaluatorResult | null;
+  statusMessage: string;
+  executionEngine: PackageExecutionTraceMeta | null;
+  repaired: boolean;
+  fallbackUsed: boolean;
+  source: string;
+  provider: string;
+  model: string;
+  attempts: ModelAttempt[];
+};
+
+type StructuredTransportFailure = {
+  code: string;
+  message: string;
+};
+
+function getStructuredTransportFailureFromMessages(messages: Record<string, unknown>[]): StructuredTransportFailure | null {
+  for (const message of messages) {
+    if ('error' in message) {
+      const error = message.error as { message?: string; data?: { code?: string } } | undefined;
+      if (typeof error?.data?.code === 'string') {
+        return {
+          code: error.data.code,
+          message: error.message ?? 'Unknown app-server protocol error.',
+        };
+      }
+    }
+
+    if (message.method === 'daemon/error' || message.method === 'error') {
+      const params = message.params as { code?: string; message?: string } | undefined;
+      if (typeof params?.code === 'string') {
+        return {
+          code: params.code,
+          message: params.message ?? 'Unknown daemon error.',
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+function getStructuredTransportFailureFromError(error: unknown): StructuredTransportFailure | null {
+  if (error instanceof AiSessionTransportNotImplementedError) {
+    return {
+      code: error.reason,
+      message: error.message,
+    };
+  }
+
+  if (error instanceof Error && typeof (error as Error & { code?: unknown }).code === 'string') {
+    return {
+      code: (error as Error & { code: string }).code,
+      message: error.message,
+    };
+  }
+
+  return null;
+}
+
 function isActiveWriterSession(session: AiSessionRecord, now = Date.now()): boolean {
   return ACTIVE_WRITER_STATES.has(session.status) && new Date(session.leaseExpiresAt).getTime() > now && !session.revokedAt;
 }
@@ -121,6 +240,35 @@ function getActiveWorkspaceVersion(session: AiSessionRecord): number {
 
 function getLatestWorkspaceVersion(session: AiSessionRecord): number {
   return session.latestWorkspaceVersion > 0 ? session.latestWorkspaceVersion : 1;
+}
+
+function isActiveTurnStatus(status: AiSessionTurnRecord['status']): boolean {
+  return status === 'submitted' || status === 'running' || status === 'awaiting_artifact';
+}
+
+function isTerminalTurnStatus(status: AiSessionTurnRecord['status']): boolean {
+  return status === 'completed' || status === 'failed' || status === 'rejected';
+}
+
+function createTurnRequestFingerprint(input: {
+  mode: ExecuteMessageInput['mode'];
+  requestText: string;
+  targetId: string | null;
+  routeMode: ExecuteMessageInput['routeMode'];
+  routeReason: ExecuteMessageInput['routeReason'];
+  allowedPaths: string[];
+  workspaceVersion: number;
+}): string {
+  return createHash('sha256')
+    .update(JSON.stringify(input))
+    .digest('hex');
+}
+
+function fingerprintPackage(pkg: GeneratedGamePackage | null): string | null {
+  if (!pkg) {
+    return null;
+  }
+  return JSON.stringify([pkg.indexHtml, pkg.gameJs, pkg.styleCss, pkg.manifestJson]);
 }
 
 export function createAiSessionService(repository: AiSessionRepository = new DrizzleAiSessionRepository()) {
@@ -265,6 +413,495 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
     return repository.updateSession(sessionId, { recoveryOutcome });
   }
 
+  function toSubmittedTurnResult(turn: AiSessionTurnRecord): MessageTurnSubmitResult {
+    return {
+      acknowledged: true,
+      deduplicated: false,
+      sessionId: turn.sessionId,
+      turnId: turn.id,
+      acceptedAt: turn.acceptedAt,
+      threadId: turn.threadId ?? '',
+      workspaceVersion: turn.workspaceVersion,
+      workspaceRoot: turn.workspaceRoot,
+      baseTargetId: turn.baseTargetId,
+      status: turn.status,
+      artifactState: turn.artifactState,
+    };
+  }
+
+  function buildTurnExecutionEngine(turn: AiSessionTurnRecord) {
+    const diagnostics = turn.diagnostics ?? {};
+    const messages = Array.isArray(turn.resultPayload?.daemonMessages) ? turn.resultPayload.daemonMessages : [];
+    const outcome: ExecutionOutcome =
+      turn.finalOutcome === 'failed'
+        ? 'hard_failure'
+        : turn.recoveryOutcome !== 'none'
+          ? 'recovered_success'
+          : 'direct_success';
+    const failureContext: FailureContext | null =
+      turn.failureCode || turn.failureMessage
+        ? {
+            checkpoint: 'transport_turn',
+            reason: turn.failureCode === 'package_schema_validation_failed' ? 'invalid_schema' : 'turn_failed',
+            code: turn.failureCode,
+            message: turn.failureMessage ?? 'Codex turn failed.',
+            transport: {
+              phase: 'transport_lost',
+              threadId: turn.threadId,
+              requiresReinit: turn.finalOutcome === 'failed',
+              lastErrorCode: turn.failureCode,
+              lastErrorMessage: turn.failureMessage,
+            },
+            session: {
+              sessionId: turn.sessionId,
+              projectId: turn.projectId,
+              status: turn.status,
+              lastFailureCode: turn.failureCode,
+              lastCheckpointId: null,
+              lastCheckpointVersion: null,
+            },
+          }
+        : null;
+    return {
+      requestedEngine: 'codex-app-server',
+      actualEngine: 'codex-app-server',
+      strategy: turn.mode === 'debug' ? 'repair_execute' : 'plan_then_execute',
+      routeReason: turn.routeReason,
+      allowedPaths: turn.allowedPaths,
+      fallbackReason: turn.finalOutcome === 'completed' && turn.recoveryOutcome !== 'none'
+        ? 'workspace_recovered_after_transport_error'
+        : null,
+      outcome,
+      recovery:
+        turn.recoveryOutcome !== 'none'
+          ? {
+              source: 'workspace' as const,
+              reason: turn.recoveryOutcome,
+              workspaceVersion: turn.workspaceVersion,
+              recoveredFromFailureCode: typeof diagnostics.recoveredFromFailureCode === 'string' ? diagnostics.recoveredFromFailureCode : turn.failureCode,
+              recoveredFromFailureMessage: typeof diagnostics.recoveredFromFailureMessage === 'string' ? diagnostics.recoveredFromFailureMessage : turn.failureMessage,
+            }
+          : null,
+      stages: [
+        createExecutionStage({
+          key: 'transport_turn',
+          status: turn.finalOutcome === 'failed' ? 'failed' : 'completed',
+          durationMs:
+            turn.startedAt && (turn.completedAt || turn.terminalAt)
+              ? Math.max(0, new Date(turn.completedAt ?? turn.terminalAt ?? turn.startedAt).getTime() - new Date(turn.startedAt).getTime())
+              : 0,
+          detail: turn.failureMessage ?? turn.turnStatus ?? turn.status,
+        }),
+      ],
+      failureContext,
+      daemonMessages: messages,
+    };
+  }
+
+  function toCompletedTurnResult(turn: AiSessionTurnRecord): MessageTurnResult {
+    const resultPayload = turn.resultPayload ?? {};
+    return {
+      acknowledged: true,
+      sessionId: turn.sessionId,
+      turnId: turn.id,
+      acceptedAt: turn.acceptedAt,
+      threadId: turn.threadId ?? '',
+      turnStatus: turn.turnStatus,
+      agentText: turn.agentText,
+      workspaceVersion: turn.workspaceVersion,
+      workspaceRoot: turn.workspaceRoot,
+      baseTargetId: turn.baseTargetId,
+      artifactState: turn.artifactState,
+      finalOutcome: turn.finalOutcome,
+      recoveryOutcome: turn.recoveryOutcome,
+      failureCode: turn.failureCode,
+      failureMessage: turn.failureMessage,
+      package: (resultPayload.package as GeneratedGamePackage | null | undefined) ?? null,
+      manifest: (resultPayload.manifest as GamePackageManifest | null | undefined) ?? null,
+      staticEvaluation: (resultPayload.staticEvaluation as EvaluatorResult | null | undefined) ?? null,
+      statusMessage:
+        typeof resultPayload.statusMessage === 'string'
+          ? resultPayload.statusMessage
+          : turn.failureMessage ?? (turn.finalOutcome === 'completed' ? 'Codex async turn completed.' : 'Codex async turn failed.'),
+      executionEngine: buildTurnExecutionEngine(turn),
+      repaired: Boolean(resultPayload.repaired),
+      fallbackUsed: Boolean(resultPayload.fallbackUsed),
+      source: typeof resultPayload.source === 'string' ? resultPayload.source : 'model',
+      provider: typeof resultPayload.provider === 'string' ? resultPayload.provider : 'openai',
+      model: typeof resultPayload.model === 'string' ? resultPayload.model : 'codex-app-server',
+      attempts: Array.isArray(resultPayload.attempts) ? (resultPayload.attempts as ModelAttempt[]) : [],
+    };
+  }
+
+  async function appendTurnInboundMessagesOnce(turn: AiSessionTurnRecord, messages: Record<string, unknown>[]) {
+    const diagnostics = turn.diagnostics ?? {};
+    if (diagnostics.transportLogsPersistedAt) {
+      return turn;
+    }
+
+    for (const message of messages) {
+      await appendTransportLog(turn.sessionId, 'turn', 'inbound', message);
+    }
+
+    return repository.updateTurn(turn.id, {
+      diagnostics: {
+        ...diagnostics,
+        transportLogsPersistedAt: new Date().toISOString(),
+      },
+    });
+  }
+
+  async function finalizeSuccessfulTurn(turn: AiSessionTurnRecord, messages: Record<string, unknown>[]) {
+    let updatedTurn = await appendTurnInboundMessagesOnce(turn, messages);
+    const turnStatus = findTurnCompletedStatus(messages);
+    const agentText = collectAgentMessageText(messages);
+    const nowIso = new Date().toISOString();
+    let workspacePackage: GeneratedGamePackage;
+
+    try {
+      workspacePackage = await readWorkspacePackageVersion(updatedTurn.sessionId, updatedTurn.workspaceVersion);
+    } catch (error) {
+      return repository.updateTurn(updatedTurn.id, {
+        status: 'awaiting_artifact',
+        artifactState: 'pending',
+        turnStatus,
+        agentText,
+        completedAt: updatedTurn.completedAt ?? nowIso,
+        diagnostics: {
+          ...updatedTurn.diagnostics,
+          durableArtifactPending: true,
+          artifactReadError: error instanceof Error ? error.message : String(error),
+          daemonMessages: messages,
+        },
+        resultPayload: {
+          ...updatedTurn.resultPayload,
+          daemonMessages: messages,
+        },
+      });
+    }
+
+    let parsed = parseGeneratedGamePackage(workspacePackage);
+    if (!parsed.ok && agentText.trim()) {
+      const recovered = recoverPackageFromAgentText(agentText);
+      if (recovered.ok) {
+        await writeWorkspacePackageVersion(updatedTurn.sessionId, updatedTurn.workspaceVersion, recovered.pkg);
+        workspacePackage = recovered.pkg;
+        parsed = recovered;
+        updatedTurn = await repository.updateTurn(updatedTurn.id, {
+          recoveryOutcome: 'same_rollout_thread_restarted',
+          diagnostics: {
+            ...updatedTurn.diagnostics,
+            recoveredFromFailureCode: 'package_schema_validation_failed',
+            recoveredFromFailureMessage: 'Recovered package from agent text.',
+          },
+        });
+      }
+    }
+
+    if (!parsed.ok) {
+      return finalizeFailedTurn(
+        updatedTurn,
+        messages,
+        'package_schema_validation_failed',
+        `${parsed.message}${parsed.issues?.length ? ` Issues: ${parsed.issues.join(' | ')}` : ''}`,
+      );
+    }
+
+    const staticEvaluation = evaluatePackageStatic(parsed.pkg);
+
+    updatedTurn = await repository.updateTurn(updatedTurn.id, {
+      status: 'completed',
+      artifactState: 'durable',
+      artifactReadyAt: nowIso,
+      completedAt: updatedTurn.completedAt ?? nowIso,
+      terminalAt: nowIso,
+      turnStatus,
+      agentText,
+      finalOutcome: 'completed',
+      failureCode: null,
+      failureMessage: null,
+      diagnostics: {
+        ...updatedTurn.diagnostics,
+        durableArtifactPending: false,
+        daemonMessages: messages,
+      },
+      resultPayload: {
+        ...updatedTurn.resultPayload,
+        package: parsed.pkg,
+        manifest: parsed.manifest,
+        staticEvaluation,
+        repaired: updatedTurn.mode === 'debug',
+        fallbackUsed: updatedTurn.recoveryOutcome !== 'none',
+        source: 'model',
+        statusMessage: turnStatus
+          ? `Codex app-server completed turn with status: ${turnStatus}`
+          : 'Codex app-server completed a turn.',
+        provider: 'openai',
+        model: 'codex-app-server',
+        attempts: [],
+        daemonMessages: messages,
+      },
+    });
+
+    const latestSession = await repository.getSession(updatedTurn.sessionId);
+    const nextLatestWorkspaceVersion = latestSession
+      ? Math.max(updatedTurn.workspaceVersion, getLatestWorkspaceVersion(latestSession))
+      : updatedTurn.workspaceVersion;
+
+    await repository.updateSession(updatedTurn.sessionId, {
+      status: 'ready',
+      activeWorkspaceVersion: updatedTurn.workspaceVersion,
+      latestWorkspaceVersion: nextLatestWorkspaceVersion,
+      appServerStatus: 'healthy',
+      daemonStatus: 'healthy',
+      threadMaterializedAt: updatedTurn.acceptedAt,
+      continuityState: 'resumable',
+      resumeEligibility: 'resumable',
+      lastSupervisorHeartbeatAt: nowIso,
+      lastFailureCode: null,
+    });
+    supervisor.updateRuntime(updatedTurn.sessionId, {
+      daemonStatus: 'healthy',
+      continuityState: 'resumable',
+      resumeEligibility: 'resumable',
+      threadId: updatedTurn.threadId,
+      threadMaterializedAt: updatedTurn.acceptedAt,
+      lastFailureCode: null,
+    });
+    await persistTransportSnapshot(updatedTurn.sessionId, finishAiSessionTransportTurn(updatedTurn.sessionId));
+    await repository.appendEvent({
+      sessionId: updatedTurn.sessionId,
+      type: 'message.turn_completed',
+      payload: {
+        turnId: updatedTurn.id,
+        threadId: updatedTurn.threadId,
+        turnStatus,
+        agentText,
+        workspaceVersion: updatedTurn.workspaceVersion,
+        workspaceRoot: updatedTurn.workspaceRoot,
+        baseTargetId: updatedTurn.baseTargetId,
+        recoveryOutcome: updatedTurn.recoveryOutcome,
+      },
+    });
+    await repository.appendEvent({
+      sessionId: updatedTurn.sessionId,
+      type: 'workspace.promoted',
+      payload: {
+        workspaceVersion: updatedTurn.workspaceVersion,
+        workspaceTargetId: getAiSessionVersionTargetId(updatedTurn.workspaceVersion),
+        workspaceRoot: updatedTurn.workspaceRoot,
+      },
+    });
+    return updatedTurn;
+  }
+
+  async function finalizeFailedTurn(turn: AiSessionTurnRecord, messages: Record<string, unknown>[], code: string | null, message: string | null) {
+    let updatedTurn = await appendTurnInboundMessagesOnce(turn, messages);
+    const nowIso = new Date().toISOString();
+    const failureCode = code ?? 'codex_app_server_turn_failed';
+    const failureMessage = message ?? 'Codex app-server turn did not complete successfully.';
+
+    try {
+      const workspacePackage = await readWorkspacePackageVersion(updatedTurn.sessionId, updatedTurn.workspaceVersion);
+      const parsed = parseGeneratedGamePackage(workspacePackage);
+      const baselineFingerprint = typeof updatedTurn.diagnostics?.baselineFingerprint === 'string' ? updatedTurn.diagnostics.baselineFingerprint : null;
+      let recovered = parsed;
+      if (!recovered.ok) {
+        const recoveredFromAgentText = recoverPackageFromAgentText(collectAgentMessageText(messages));
+        if (recoveredFromAgentText.ok) {
+          await writeWorkspacePackageVersion(updatedTurn.sessionId, updatedTurn.workspaceVersion, recoveredFromAgentText.pkg);
+          recovered = recoveredFromAgentText;
+        }
+      }
+      if (recovered.ok) {
+        const nextFingerprint = fingerprintPackage(recovered.pkg);
+        if (!baselineFingerprint || nextFingerprint !== baselineFingerprint) {
+          const staticEvaluation = evaluatePackageStatic(recovered.pkg);
+          if (staticEvaluation.ok) {
+            const recoveredTurn = await repository.updateTurn(updatedTurn.id, {
+              status: 'completed',
+              artifactState: 'durable',
+              completedAt: updatedTurn.completedAt ?? nowIso,
+              terminalAt: nowIso,
+              artifactReadyAt: nowIso,
+              finalOutcome: 'completed',
+              recoveryOutcome: 'same_rollout_thread_restarted',
+              diagnostics: {
+                ...updatedTurn.diagnostics,
+                recoveredFromFailureCode: failureCode,
+                recoveredFromFailureMessage: failureMessage,
+                daemonMessages: messages,
+              },
+              resultPayload: {
+                ...updatedTurn.resultPayload,
+                package: recovered.pkg,
+                manifest: recovered.manifest,
+                staticEvaluation,
+                repaired: updatedTurn.mode === 'debug',
+                fallbackUsed: true,
+                source: 'model',
+                statusMessage: `Recovered package from workspace after transport error; re-initialize the AI session before the next turn. ${failureMessage}`,
+                provider: 'openai',
+                model: 'codex-app-server',
+                attempts: [],
+                daemonMessages: messages,
+              },
+            });
+            const latestSession = await repository.getSession(updatedTurn.sessionId);
+            const nextLatestWorkspaceVersion = latestSession
+              ? Math.max(recoveredTurn.workspaceVersion, getLatestWorkspaceVersion(latestSession))
+              : recoveredTurn.workspaceVersion;
+            await repository.updateSession(updatedTurn.sessionId, {
+              status: 'ready',
+              activeWorkspaceVersion: recoveredTurn.workspaceVersion,
+              latestWorkspaceVersion: nextLatestWorkspaceVersion,
+              appServerStatus: 'degraded',
+              daemonStatus: 'degraded',
+              threadMaterializedAt: recoveredTurn.acceptedAt,
+              continuityState: 'continuity_lost',
+              resumeEligibility: 'restart_required',
+              lastSupervisorHeartbeatAt: nowIso,
+              lastFailureCode: failureCode,
+            });
+            await persistTransportSnapshot(updatedTurn.sessionId, markAiSessionTransportLost(updatedTurn.sessionId, failureCode, failureMessage));
+            await repository.appendEvent({
+              sessionId: updatedTurn.sessionId,
+              type: 'message.turn_recovered',
+              payload: {
+                turnId: updatedTurn.id,
+                workspaceVersion: updatedTurn.workspaceVersion,
+                failureCode,
+                failureMessage,
+              },
+            });
+            return recoveredTurn;
+          }
+        }
+      }
+    } catch {
+      // keep original hard failure path
+    }
+
+    updatedTurn = await repository.updateTurn(updatedTurn.id, {
+      status: 'failed',
+      artifactState: 'missing',
+      completedAt: updatedTurn.completedAt ?? nowIso,
+      terminalAt: nowIso,
+      finalOutcome: 'failed',
+      failureCode,
+      failureMessage,
+      diagnostics: {
+        ...updatedTurn.diagnostics,
+        daemonMessages: messages,
+      },
+      resultPayload: {
+        ...updatedTurn.resultPayload,
+        daemonMessages: messages,
+      },
+    });
+
+    await repository.updateSession(updatedTurn.sessionId, {
+      status: 'ready',
+      appServerStatus: 'degraded',
+      daemonStatus: 'degraded',
+      appServerThreadId: null,
+      continuityState: 'continuity_lost',
+      resumeEligibility: 'restart_required',
+      recoveryOutcome: 'none',
+      lastFailureCode: failureCode,
+    });
+    await persistTransportSnapshot(updatedTurn.sessionId, markAiSessionTransportLost(updatedTurn.sessionId, failureCode, failureMessage));
+    supervisor.updateRuntime(updatedTurn.sessionId, {
+      daemonStatus: 'degraded',
+      continuityState: 'continuity_lost',
+      resumeEligibility: 'restart_required',
+      threadId: null,
+      lastFailureCode: failureCode,
+    });
+    await persistTransportSnapshot(updatedTurn.sessionId, syncAiSessionTransportThreadId(updatedTurn.sessionId, null));
+    await repository.appendEvent({
+      sessionId: updatedTurn.sessionId,
+      type: 'message.turn_failed',
+      payload: {
+        turnId: updatedTurn.id,
+        workspaceVersion: updatedTurn.workspaceVersion,
+        workspaceRoot: updatedTurn.workspaceRoot,
+        failureCode,
+        failureMessage,
+      },
+    });
+    return updatedTurn;
+  }
+
+  async function syncTurnFromDaemon(turn: AiSessionTurnRecord): Promise<AiSessionTurnRecord> {
+    if (isTerminalTurnStatus(turn.status)) {
+      return turn;
+    }
+
+    const sandboxProvider = getSandboxProvider();
+    const daemonStatus = await getCodexAppServerDaemonTurnStatus(sandboxProvider, turn.sessionId, turn.id).catch(() => null);
+    if (!daemonStatus) {
+      return turn;
+    }
+
+    let updatedTurn = turn;
+    if (daemonStatus.phase === 'submitted' || daemonStatus.phase === 'running') {
+      updatedTurn = await repository.updateTurn(turn.id, {
+        status: daemonStatus.phase === 'submitted' ? 'submitted' : 'running',
+        threadId: daemonStatus.state.threadId ?? turn.threadId,
+        startedAt: daemonStatus.startedAt,
+        completedAt: daemonStatus.completedAt,
+        diagnostics: {
+          ...turn.diagnostics,
+          daemonPhase: daemonStatus.phase,
+          daemonState: daemonStatus.state,
+        },
+      });
+      return updatedTurn;
+    }
+
+    const daemonResult = await getCodexAppServerDaemonTurnResult(sandboxProvider, turn.sessionId, turn.id).catch(() => daemonStatus);
+    if (!daemonResult) {
+      return updatedTurn;
+    }
+
+    updatedTurn = await repository.updateTurn(turn.id, {
+      threadId: daemonResult.state.threadId ?? turn.threadId,
+      startedAt: daemonResult.startedAt,
+      completedAt: daemonResult.completedAt,
+      diagnostics: {
+        ...turn.diagnostics,
+        daemonPhase: daemonResult.phase,
+        daemonState: daemonResult.state,
+      },
+    });
+
+    const messages = daemonResult.messages ?? [];
+    if (daemonResult.phase === 'failed') {
+      const structuredFailure = getStructuredTransportFailureFromMessages(messages);
+      return finalizeFailedTurn(
+        updatedTurn,
+        messages,
+        structuredFailure?.code ?? daemonResult.code ?? 'codex_app_server_turn_failed',
+        structuredFailure?.message ?? daemonResult.error ?? 'Codex app-server turn failed.',
+      );
+    }
+
+    const protocolError = findJsonRpcError(messages);
+    const structuredTurnFailure = getStructuredTransportFailureFromMessages(messages);
+    const turnStatus = findTurnCompletedStatus(messages);
+    if (protocolError || !turnStatus || turnStatus === 'interrupted') {
+      return finalizeFailedTurn(
+        updatedTurn,
+        messages,
+        structuredTurnFailure?.code ?? daemonResult.code ?? 'codex_app_server_turn_failed',
+        structuredTurnFailure?.message ?? protocolError ?? daemonResult.error ?? `Codex app-server turn did not complete successfully (${turnStatus ?? 'unknown'}).`,
+      );
+    }
+
+    return finalizeSuccessfulTurn(updatedTurn, messages);
+  }
+
   async function getWorkspaceVersionMetas(session: AiSessionRecord) {
     const events = await repository.listEvents(session.id);
     const byVersion = new Map<number, { workspaceVersion: number; createdAt: string; sourceTargetId: string | null }>();
@@ -311,7 +948,7 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
 
     const sandboxProvider = getSandboxProvider();
     const daemonHealth = await getCodexAppServerDaemonHealth(sandboxProvider, session.id);
-    if (!daemonHealth?.ok || !daemonHealth.initialized || daemonHealth.threadId !== session.appServerThreadId) {
+    if (!daemonHealth || !daemonHealth.initialized || daemonHealth.threadId !== session.appServerThreadId) {
       return null;
     }
 
@@ -764,9 +1401,12 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
       }
 
       const loginError = findLoginError(startResult.messages);
+      const structuredStartFailure = getStructuredTransportFailureFromMessages(startResult.messages);
       const runnerError = startResult.error ?? findRunnerError(startResult.messages);
       const threadStartError = findThreadStartError(startResult.messages);
       if (!didAccountLoginSucceed(startResult.messages) || loginError) {
+        const failureCode = structuredStartFailure?.code ?? startResult.code ?? 'codex_app_server_external_auth_login_failed';
+        const failureMessage = loginError ?? structuredStartFailure?.message ?? 'Codex app-server external auth login did not succeed.';
         await repository.updateSession(sessionId, {
           appServerStatus: 'degraded',
           daemonStatus: 'degraded',
@@ -774,20 +1414,22 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
           continuityState: 'failed',
           resumeEligibility: 'restart_required',
           recoveryOutcome: 'none',
-          lastFailureCode: 'codex_app_server_external_auth_login_failed',
+          lastFailureCode: failureCode,
         });
         await persistTransportSnapshot(sessionId, markAiSessionTransportLost(
           sessionId,
-          'codex_app_server_external_auth_login_failed',
-          loginError ?? 'Codex app-server external auth login did not succeed.',
+          failureCode,
+          failureMessage,
         ));
         throw new AiSessionTransportNotImplementedError(
-          loginError ?? 'Codex app-server external auth login did not succeed.',
-          'codex_app_server_external_auth_login_failed',
+          failureMessage,
+          failureCode,
         );
       }
 
-      if (threadStartError || runnerError) {
+      if (threadStartError || runnerError || !startResult.ok) {
+        const failureCode = structuredStartFailure?.code ?? startResult.code ?? (threadStartError ? 'codex_app_server_thread_start_failed' : 'codex_app_server_runner_failed');
+        const failureMessage = structuredStartFailure?.message ?? threadStartError ?? runnerError ?? 'Codex app-server init failed after login.';
         await repository.updateSession(sessionId, {
           appServerStatus: 'degraded',
           daemonStatus: 'degraded',
@@ -795,16 +1437,16 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
           continuityState: 'failed',
           resumeEligibility: 'restart_required',
           recoveryOutcome: 'none',
-          lastFailureCode: threadStartError ? 'codex_app_server_thread_start_failed' : 'codex_app_server_runner_failed',
+          lastFailureCode: failureCode,
         });
         await persistTransportSnapshot(sessionId, markAiSessionTransportLost(
           sessionId,
-          threadStartError ? 'codex_app_server_thread_start_failed' : 'codex_app_server_runner_failed',
-          threadStartError ?? runnerError ?? 'Codex app-server init failed after login.',
+          failureCode,
+          failureMessage,
         ));
         throw new AiSessionTransportNotImplementedError(
-          threadStartError ?? runnerError ?? 'Codex app-server init failed after login.',
-          threadStartError ? 'codex_app_server_thread_start_failed' : 'codex_app_server_runner_failed',
+          failureMessage,
+          failureCode,
         );
       }
 
@@ -931,32 +1573,51 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
       return { session: updatedSession, checkpoint, project: persistedProject };
     },
 
-    async executeMessage(sessionId: string, input: {
-      mode: 'create' | 'modify' | 'debug';
-      requestText: string;
-      targetId?: string | null;
-      routeMode?: 'design' | 'patch' | 'repair' | null;
-      routeReason?: string | null;
-      allowedPaths?: string[];
-    }): Promise<{
-      acknowledged: true;
-      sessionId: string;
-      acceptedAt: string;
-      threadId: string;
-      turnStatus: string | null;
-      agentText: string;
-      workspaceVersion: number;
-      workspaceRoot: string;
-      baseTargetId: string | null;
-    }> {
+    async submitMessageTurn(sessionId: string, input: ExecuteMessageInput): Promise<MessageTurnSubmitResult> {
       let session = await repository.getSession(sessionId);
       if (!session) {
         throw new Error(`Unknown AI session ${sessionId}`);
       }
 
-      const recovered = await this.initializeTransport(sessionId, null);
-      session = recovered.session;
-      const transport = recovered.transport;
+      const earlyFingerprint = createTurnRequestFingerprint({
+        mode: input.mode,
+        requestText: input.requestText,
+        targetId: input.targetId ?? null,
+        routeMode: input.routeMode ?? null,
+        routeReason: input.routeReason ?? null,
+        allowedPaths: input.allowedPaths ?? [],
+        workspaceVersion: input.mode === 'create' ? getActiveWorkspaceVersion(session) : getLatestWorkspaceVersion(session) + 1,
+      });
+      const preexistingTurn = await repository.findTurnByRequestFingerprint(sessionId, earlyFingerprint);
+      if (preexistingTurn && isActiveTurnStatus(preexistingTurn.status)) {
+        const syncedPreexistingTurn = await syncTurnFromDaemon(preexistingTurn);
+        if (isActiveTurnStatus(syncedPreexistingTurn.status)) {
+          return {
+            ...toSubmittedTurnResult(syncedPreexistingTurn),
+            deduplicated: true,
+          };
+        }
+      }
+
+      const preexistingActiveTurn = await repository.findActiveTurn(sessionId);
+      if (preexistingActiveTurn) {
+        const syncedPreexistingActiveTurn = await syncTurnFromDaemon(preexistingActiveTurn);
+        if (isActiveTurnStatus(syncedPreexistingActiveTurn.status)) {
+          throw new AiSessionTurnConflictError(`AI session ${sessionId} already has active turn ${syncedPreexistingActiveTurn.id}.`);
+        }
+      }
+
+      const canReuseReadyTransport =
+        session.status === 'ready'
+        && session.boxStatus === 'ready'
+        && session.authState === 'ready'
+        && session.appServerStatus !== 'failed'
+        && Boolean(session.appServerThreadId);
+      const existingTransport = canReuseReadyTransport ? await this.getTransportSnapshot(sessionId).catch(() => null) : null;
+      if (!canReuseReadyTransport || !existingTransport || existingTransport.phase !== 'ready') {
+        const recovered = await this.initializeTransport(sessionId, null);
+        session = recovered.session;
+      }
       let runtime = supervisor.getRuntime(session) ?? supervisor.restoreRuntime(session);
 
       if (!runtime) {
@@ -988,9 +1649,18 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
 
       let executionWorkspaceVersion = getActiveWorkspaceVersion(session);
       let baseTargetId: string | null = null;
+      let baselineFingerprint: string | null = null;
+      if (input.mode === 'create') {
+        try {
+          baselineFingerprint = fingerprintPackage(await readWorkspacePackageVersion(session.id, executionWorkspaceVersion));
+        } catch {
+          baselineFingerprint = null;
+        }
+      }
       if (input.mode !== 'create') {
         const resolvedBase = await resolveWorkspaceBasePackage(session, input.targetId ?? '__current__');
         executionWorkspaceVersion = getLatestWorkspaceVersion(session) + 1;
+        baselineFingerprint = fingerprintPackage(resolvedBase.pkg);
         await writeWorkspacePackageVersion(session.id, executionWorkspaceVersion, resolvedBase.pkg);
         baseTargetId = resolvedBase.sourceTargetId;
         await repository.appendEvent({
@@ -1005,6 +1675,15 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
       }
 
       const workspaceRoot = getAiSessionWorkspaceAbsoluteRoot(sessionId, executionWorkspaceVersion);
+      const requestFingerprint = createTurnRequestFingerprint({
+        mode: input.mode,
+        requestText: input.requestText,
+        targetId: input.targetId ?? null,
+        routeMode: input.routeMode ?? null,
+        routeReason: input.routeReason ?? null,
+        allowedPaths: input.allowedPaths ?? [],
+        workspaceVersion: executionWorkspaceVersion,
+      });
 
       await repository.appendEvent({
         sessionId,
@@ -1018,230 +1697,249 @@ export function createAiSessionService(repository: AiSessionRepository = new Dri
           allowedPaths: input.allowedPaths ?? [],
           workspaceVersion: executionWorkspaceVersion,
           workspaceRoot,
+          requestFingerprint,
         },
       });
       await repository.updateSession(sessionId, { status: 'busy' });
       await persistTransportSnapshot(sessionId, startAiSessionTransportTurn(sessionId));
-      try {
-        await appendTransportLog(
-          sessionId,
-          'turn',
-          'system',
-          `Starting ${input.mode} turn in workspace v${executionWorkspaceVersion}.`,
-        );
+      await appendTransportLog(sessionId, 'turn', 'system', `Starting ${input.mode} turn in workspace v${executionWorkspaceVersion}.`);
 
-        const sandboxProvider = getSandboxProvider();
-        const daemonHealth = await getCodexAppServerDaemonHealth(sandboxProvider, sessionId);
-        if (!daemonHealth) {
-          await repository.updateSession(sessionId, {
-            status: 'ready',
-            appServerStatus: 'stopped',
-            daemonStatus: 'stopped',
-            appServerThreadId: null,
-            continuityState: 'continuity_lost',
-            resumeEligibility: 'restart_required',
-            recoveryOutcome: 'none',
-            lastFailureCode: 'codex_daemon_unreachable',
-          });
-          await persistTransportSnapshot(sessionId, markAiSessionTransportLost(sessionId, 'codex_daemon_unreachable', 'Codex daemon is not reachable for this AI session.'));
-          supervisor.updateRuntime(sessionId, {
-            daemonStatus: 'stopped',
-            continuityState: 'continuity_lost',
-            resumeEligibility: 'restart_required',
-            threadId: null,
-            lastFailureCode: 'codex_daemon_unreachable',
-          });
-          await persistTransportSnapshot(sessionId, syncAiSessionTransportThreadId(sessionId, null));
-          throw new AiSessionTransportNotInitializedError('Codex daemon is not reachable for this AI session. Restart the session.');
-        }
-
-        const runtimeState = await sandboxProvider.ensureCodexRuntime();
-        if (!runtimeState.ready) {
-          await repository.updateSession(sessionId, {
-            status: 'ready',
-            appServerStatus: 'failed',
-            daemonStatus: 'degraded',
-            appServerThreadId: null,
-            continuityState: 'failed',
-            resumeEligibility: 'restart_required',
-            recoveryOutcome: 'none',
-            lastFailureCode: 'codex_app_server_binary_missing',
-          });
-          await persistTransportSnapshot(sessionId, markAiSessionTransportLost(
-            sessionId,
-            'codex_app_server_binary_missing',
-            runtimeState.reason ?? 'Codex runtime is not available in the Box.',
-          ));
-          supervisor.updateRuntime(sessionId, {
-            daemonStatus: 'degraded',
-            continuityState: 'failed',
-            resumeEligibility: 'restart_required',
-            threadId: null,
-            lastFailureCode: 'codex_app_server_binary_missing',
-          });
-          throw new AiSessionTransportNotImplementedError(
-            runtimeState.reason ?? 'Codex runtime is not available in the Box.',
-            'codex_app_server_binary_missing',
-          );
-        }
-        const appServerConfig = sandboxProvider.getDefaultCodexAppServerConfig();
-        const hostTokenClient = HostTokenServiceClient.fromEnv();
-        const hostTokens = await hostTokenClient.refresh({ sessionId, reason: 'unauthorized' });
-        const acceptedAt = new Date().toISOString();
-        const hostTokenRuntime = {
-          sessionId,
-          url: hostTokenClient.getBaseUrl(),
-          apiKey: hostTokenClient.getApiKey(),
-        };
-
-        const threadId = session.appServerThreadId;
-        await ensureCodexAppServerDaemon(
-          sandboxProvider,
-          sessionId,
-          appServerConfig,
-          workspaceRoot,
-          hostTokenRuntime,
-        );
-        const messages = [createTurnStartMessage(threadId, input.requestText, workspaceRoot)];
-
-        await repository.appendEvent({
-          sessionId,
-          type: 'message.dispatched_to_daemon',
-          payload: {
-            mode: input.mode,
-            threadId,
-            workspaceVersion: executionWorkspaceVersion,
-            workspaceRoot,
-            baseTargetId,
-          },
-        });
-
-        for (const message of messages) {
-          await appendTransportLog(sessionId, 'turn', 'outbound', message);
-        }
-
-        const turnResult = await callCodexAppServerDaemon(sandboxProvider, sessionId, {
-          phase: 'turn',
-          messages,
-          stopOnMethods: ['turn/completed'],
-          timeoutMs: 300000,
-        });
-
-        for (const message of turnResult.messages) {
-          await appendTransportLog(sessionId, 'turn', 'inbound', message);
-        }
-
-        const protocolError = findJsonRpcError(turnResult.messages);
-        const turnStatus = findTurnCompletedStatus(turnResult.messages);
-        const agentText = collectAgentMessageText(turnResult.messages);
-        if (!turnResult.ok || protocolError || !turnStatus || turnStatus === 'interrupted') {
-          await repository.updateSession(sessionId, {
-            status: 'ready',
-            appServerStatus: 'degraded',
-            daemonStatus: 'degraded',
-            appServerThreadId: null,
-            continuityState: 'continuity_lost',
-            resumeEligibility: 'restart_required',
-            recoveryOutcome: 'none',
-            lastFailureCode: 'codex_app_server_turn_failed',
-          });
-          await persistTransportSnapshot(sessionId, markAiSessionTransportLost(
-            sessionId,
-            'codex_app_server_turn_failed',
-            protocolError ?? turnResult.error ?? `Codex app-server turn did not complete successfully (${turnStatus ?? 'unknown'}).`,
-          ));
-          supervisor.updateRuntime(sessionId, {
-            daemonStatus: 'degraded',
-            continuityState: 'continuity_lost',
-            resumeEligibility: 'restart_required',
-            threadId: null,
-            lastFailureCode: 'codex_app_server_turn_failed',
-          });
-          throw new AiSessionTransportNotImplementedError(
-            protocolError ?? turnResult.error ?? `Codex app-server turn did not complete successfully (${turnStatus ?? 'unknown'}).`,
-            'codex_app_server_turn_failed',
-          );
-        }
-
+      const sandboxProvider = getSandboxProvider();
+      const daemonHealth = await getCodexAppServerDaemonHealth(sandboxProvider, sessionId);
+      if (!daemonHealth) {
         await repository.updateSession(sessionId, {
           status: 'ready',
-          appServerStatus: 'healthy',
-          daemonStatus: 'healthy',
-          threadMaterializedAt: session.threadMaterializedAt ?? acceptedAt,
-          continuityState: session.threadMaterializedAt ? 'resumable' : 'first_turn_materialized',
-          resumeEligibility: 'resumable',
-          lastSupervisorHeartbeatAt: new Date().toISOString(),
-          lastFailureCode: null,
+          appServerStatus: 'stopped',
+          daemonStatus: 'stopped',
+          appServerThreadId: null,
+          continuityState: 'continuity_lost',
+          resumeEligibility: 'restart_required',
+          recoveryOutcome: 'none',
+          lastFailureCode: 'codex_daemon_unreachable',
         });
+        await persistTransportSnapshot(sessionId, markAiSessionTransportLost(sessionId, 'codex_daemon_unreachable', 'Codex daemon is not reachable for this AI session.'));
         supervisor.updateRuntime(sessionId, {
-          daemonStatus: 'healthy',
-          continuityState: session.threadMaterializedAt ? 'resumable' : 'first_turn_materialized',
-          resumeEligibility: 'resumable',
-          threadId,
-          threadMaterializedAt: session.threadMaterializedAt ?? acceptedAt,
-          lastFailureCode: null,
+          daemonStatus: 'stopped',
+          continuityState: 'continuity_lost',
+          resumeEligibility: 'restart_required',
+          threadId: null,
+          lastFailureCode: 'codex_daemon_unreachable',
         });
-        await persistTransportSnapshot(sessionId, finishAiSessionTransportTurn(sessionId));
-        await repository.appendEvent({
-          sessionId,
-          type: 'message.turn_completed',
-          payload: {
-            threadId,
-            turnStatus,
-            agentText,
-            workspaceVersion: executionWorkspaceVersion,
-            workspaceRoot,
-            baseTargetId,
-            recoveryOutcome: session.recoveryOutcome,
-          },
-        });
+        await persistTransportSnapshot(sessionId, syncAiSessionTransportThreadId(sessionId, null));
+        throw new AiSessionTransportNotInitializedError('Codex daemon is not reachable for this AI session. Restart the session.');
+      }
 
-        return {
-          acknowledged: true,
-          sessionId,
-          acceptedAt,
+      const runtimeState = await sandboxProvider.ensureCodexRuntime();
+      if (!runtimeState.ready) {
+        await repository.updateSession(sessionId, {
+          status: 'ready',
+          appServerStatus: 'failed',
+          daemonStatus: 'degraded',
+          appServerThreadId: null,
+          continuityState: 'failed',
+          resumeEligibility: 'restart_required',
+          recoveryOutcome: 'none',
+          lastFailureCode: 'codex_app_server_binary_missing',
+        });
+        await persistTransportSnapshot(sessionId, markAiSessionTransportLost(sessionId, 'codex_app_server_binary_missing', runtimeState.reason ?? 'Codex runtime is not available in the Box.'));
+        supervisor.updateRuntime(sessionId, {
+          daemonStatus: 'degraded',
+          continuityState: 'failed',
+          resumeEligibility: 'restart_required',
+          threadId: null,
+          lastFailureCode: 'codex_app_server_binary_missing',
+        });
+        throw new AiSessionTransportNotImplementedError(runtimeState.reason ?? 'Codex runtime is not available in the Box.', 'codex_app_server_binary_missing');
+      }
+
+      const appServerConfig = sandboxProvider.getDefaultCodexAppServerConfig();
+      const hostTokenClient = HostTokenServiceClient.fromEnv();
+      await hostTokenClient.refresh({ sessionId, reason: 'unauthorized' });
+      const acceptedAt = new Date().toISOString();
+      const hostTokenRuntime = {
+        sessionId,
+        url: hostTokenClient.getBaseUrl(),
+        apiKey: hostTokenClient.getApiKey(),
+      };
+
+      const threadId = session.appServerThreadId;
+      if (!threadId) {
+        await repository.updateSession(sessionId, {
+          status: 'ready',
+          appServerStatus: 'stopped',
+          daemonStatus: 'stopped',
+          continuityState: 'continuity_lost',
+          resumeEligibility: 'restart_required',
+          recoveryOutcome: 'none',
+          lastFailureCode: 'codex_turn_missing_thread',
+        });
+        await persistTransportSnapshot(sessionId, markAiSessionTransportLost(sessionId, 'codex_turn_missing_thread', 'Codex turn cannot start without a thread id.'));
+        throw new AiSessionTransportNotInitializedError('Codex turn cannot start without a thread id. Reinitialize the session.');
+      }
+
+      await ensureCodexAppServerDaemon(sandboxProvider, sessionId, appServerConfig, workspaceRoot, hostTokenRuntime);
+      const messages = [createTurnStartMessage(threadId, input.requestText, workspaceRoot)];
+      for (const message of messages) {
+        await appendTransportLog(sessionId, 'turn', 'outbound', message);
+      }
+
+      const turn = await repository.createTurn({
+        id: randomUUID(),
+        sessionId,
+        projectId: session.projectId,
+        workspaceVersion: executionWorkspaceVersion,
+        workspaceRoot,
+        mode: input.mode,
+        requestText: input.requestText,
+        targetId: input.targetId ?? null,
+        baseTargetId,
+        routeMode: input.routeMode ?? null,
+        routeReason: input.routeReason ?? null,
+        allowedPaths: input.allowedPaths ?? [],
+        requestFingerprint,
+        status: 'submitted',
+        artifactState: 'pending',
+        threadId,
+        acceptedAt,
+        startedAt: null,
+        completedAt: null,
+        terminalAt: null,
+        artifactReadyAt: null,
+        turnStatus: null,
+        agentText: '',
+        recoveryOutcome: session.recoveryOutcome,
+        finalOutcome: 'pending',
+        failureCode: null,
+        failureMessage: null,
+        diagnostics: {
+          submissionSource: 'host_submit',
+          baselineFingerprint,
+        },
+        resultPayload: {},
+      });
+
+      await repository.appendEvent({
+        sessionId,
+        type: 'message.dispatched_to_daemon',
+        payload: {
+          turnId: turn.id,
+          mode: input.mode,
           threadId,
-          turnStatus,
-          agentText,
           workspaceVersion: executionWorkspaceVersion,
           workspaceRoot,
           baseTargetId,
-        };
-      } catch (error) {
-        const alreadyHandled =
-          error instanceof AiSessionTransportNotInitializedError ||
-          error instanceof AiSessionTransportNotImplementedError ||
-          error instanceof AiSessionMessageNotReadyError;
-        if (!alreadyHandled) {
-          await repository.updateSession(sessionId, {
-            status: 'ready',
-            appServerStatus: 'degraded',
-            daemonStatus: 'degraded',
-            appServerThreadId: null,
-            continuityState: 'continuity_lost',
-            resumeEligibility: 'restart_required',
-            recoveryOutcome: 'none',
-            lastFailureCode: 'codex_turn_unexpected_error',
-          });
-          await persistTransportSnapshot(
-            sessionId,
-            markAiSessionTransportLost(
-              sessionId,
-              'codex_turn_unexpected_error',
-              error instanceof Error ? error.message : 'Unexpected error during Codex turn execution.',
-            ),
-          );
-          supervisor.updateRuntime(sessionId, {
-            daemonStatus: 'degraded',
-            continuityState: 'continuity_lost',
-            resumeEligibility: 'restart_required',
-            threadId: null,
-            lastFailureCode: 'codex_turn_unexpected_error',
-          });
-          await persistTransportSnapshot(sessionId, syncAiSessionTransportThreadId(sessionId, null));
-        }
-        throw error;
+        },
+      });
+
+      const daemonSubmit = await submitCodexAppServerDaemonTurn(sandboxProvider, sessionId, {
+        turnId: turn.id,
+        phase: 'turn',
+        messages,
+        stopOnMethods: ['turn/completed'],
+        timeoutMs: 300000,
+      });
+
+      const submittedTurn = await repository.updateTurn(turn.id, {
+        status: daemonSubmit.turn.phase === 'running' ? 'running' : 'submitted',
+        threadId: daemonSubmit.turn.state.threadId ?? threadId,
+        startedAt: daemonSubmit.turn.startedAt,
+        diagnostics: {
+          ...turn.diagnostics,
+          daemonSubmissionDeduplicated: daemonSubmit.deduplicated,
+          daemonPhase: daemonSubmit.turn.phase,
+          daemonState: daemonSubmit.turn.state,
+        },
+      });
+
+      return {
+        ...toSubmittedTurnResult(submittedTurn),
+        deduplicated: daemonSubmit.deduplicated,
+      };
+    },
+
+    async getMessageTurnStatus(sessionId: string, turnId: string) {
+      const turn = await repository.getTurn(turnId);
+      if (!turn || turn.sessionId !== sessionId) {
+        throw new Error(`Unknown AI session turn ${turnId}`);
       }
+      const syncedTurn = await syncTurnFromDaemon(turn);
+      return {
+        turnId: syncedTurn.id,
+        sessionId: syncedTurn.sessionId,
+        status: syncedTurn.status,
+        artifactState: syncedTurn.artifactState,
+        acceptedAt: syncedTurn.acceptedAt,
+        startedAt: syncedTurn.startedAt,
+        completedAt: syncedTurn.completedAt,
+        terminalAt: syncedTurn.terminalAt,
+        workspaceVersion: syncedTurn.workspaceVersion,
+        workspaceRoot: syncedTurn.workspaceRoot,
+        threadId: syncedTurn.threadId,
+        turnStatus: syncedTurn.turnStatus,
+        finalOutcome: syncedTurn.finalOutcome,
+        recoveryOutcome: syncedTurn.recoveryOutcome,
+        failureCode: syncedTurn.failureCode,
+        failureMessage: syncedTurn.failureMessage,
+      };
+    },
+
+    async getMessageTurnResult(sessionId: string, turnId: string): Promise<MessageTurnResult> {
+      const turn = await repository.getTurn(turnId);
+      if (!turn || turn.sessionId !== sessionId) {
+        throw new Error(`Unknown AI session turn ${turnId}`);
+      }
+      const syncedTurn = await syncTurnFromDaemon(turn);
+      if (!isTerminalTurnStatus(syncedTurn.status)) {
+        throw new AiSessionMessageNotReadyError(`AI session turn ${turnId} has not finished yet.`);
+      }
+      if (syncedTurn.status === 'completed' && syncedTurn.artifactState !== 'durable') {
+        throw new AiSessionMessageNotReadyError(`AI session turn ${turnId} is waiting for durable workspace artifacts.`);
+      }
+      return toCompletedTurnResult(syncedTurn);
+    },
+
+    async executeMessage(sessionId: string, input: ExecuteMessageInput): Promise<{
+      acknowledged: true;
+      sessionId: string;
+      acceptedAt: string;
+      threadId: string;
+      turnStatus: string | null;
+      agentText: string;
+      workspaceVersion: number;
+      workspaceRoot: string;
+      baseTargetId: string | null;
+      turnId: string;
+    }> {
+      const submitted = await this.submitMessageTurn(sessionId, input);
+      const startedAt = Date.now();
+
+      while (Date.now() - startedAt < 310000) {
+        try {
+          const result = await this.getMessageTurnResult(sessionId, submitted.turnId);
+          if (result.finalOutcome === 'failed' || !result.package || !result.manifest || !result.staticEvaluation) {
+            throw new AiSessionTransportNotImplementedError(result.failureMessage ?? 'Codex app-server turn failed.', result.failureCode ?? 'codex_app_server_turn_failed');
+          }
+          return {
+            acknowledged: true,
+            sessionId: result.sessionId,
+            acceptedAt: result.acceptedAt,
+            threadId: result.threadId,
+            turnStatus: result.turnStatus,
+            agentText: result.agentText,
+            workspaceVersion: result.workspaceVersion,
+            workspaceRoot: result.workspaceRoot,
+            baseTargetId: result.baseTargetId,
+            turnId: result.turnId,
+          };
+        } catch (error) {
+          if (!(error instanceof AiSessionMessageNotReadyError)) {
+            throw error;
+          }
+          await new Promise(resolve => setTimeout(resolve, 250));
+        }
+      }
+
+      throw new AiSessionTransportNotImplementedError('Timed out waiting for AI session turn completion.', 'codex_turn_result_timeout');
     },
 
     async promoteWorkspaceVersion(sessionId: string, workspaceVersion: number) {

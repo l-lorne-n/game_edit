@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 
 import {
   AiSessionMessageNotReadyError,
+  AiSessionTurnConflictError,
   AiSessionTransportNotInitializedError,
   AiSessionTransportNotImplementedError,
   createAiSessionService,
@@ -28,7 +29,7 @@ export async function POST(
       return NextResponse.json({ ok: false, error: 'mode and requestText are required' }, { status: 400 });
     }
 
-    const result = await aiSessionService.executeMessage(id, {
+    const result = await aiSessionService.submitMessageTurn(id, {
       mode: body.mode,
       requestText: body.requestText,
       targetId: body.targetId ?? null,
@@ -43,6 +44,9 @@ export async function POST(
       return NextResponse.json({ ok: false, error: error.message, code: error.code }, { status: 409 });
     }
     if (error instanceof AiSessionMessageNotReadyError) {
+      return NextResponse.json({ ok: false, error: error.message, code: error.code }, { status: 409 });
+    }
+    if (error instanceof AiSessionTurnConflictError) {
       return NextResponse.json({ ok: false, error: error.message, code: error.code }, { status: 409 });
     }
     if (error instanceof AiSessionTransportNotImplementedError) {

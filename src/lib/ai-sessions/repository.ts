@@ -6,6 +6,7 @@ import {
   aiSessionCheckpoints,
   aiSessionEvents,
   aiSessionTransportLogs,
+  aiSessionTurns,
   aiSessions,
   getDb,
 } from '@/lib/db';
@@ -17,12 +18,15 @@ import type {
   AiSessionRecord,
   AiSessionRepository,
   AiSessionResumeEligibility,
+  AiSessionTurnRecord,
   AiSessionTransportLogDirection,
   AiSessionTransportLogEntry,
   AiSessionTransportLogPhase,
   CreateAiSessionCheckpointInput,
   CreateAiSessionEventInput,
+  CreateAiSessionTurnInput,
   UpdateAiSessionInput,
+  UpdateAiSessionTurnInput,
 } from '@/lib/ai-sessions/types';
 
 let aiSessionSchemaInitPromise: Promise<void> | null = null;
@@ -152,6 +156,44 @@ async function ensureAiSessionSchema(): Promise<void> {
         )
       `);
       await db.execute(sql`create index if not exists ai_session_transport_logs_session_created_idx on ai_session_transport_logs(session_id, created_at)`);
+      await db.execute(sql`
+        create table if not exists ai_session_turns (
+          id text primary key,
+          session_id text not null references ai_sessions(id) on delete cascade,
+          project_id text not null,
+          workspace_version integer not null,
+          workspace_root text not null,
+          mode text not null,
+          request_text text not null,
+          target_id text,
+          base_target_id text,
+          route_mode text,
+          route_reason text,
+          allowed_paths jsonb not null default '[]'::jsonb,
+          request_fingerprint text not null,
+          status text not null default 'submitted',
+          artifact_state text not null default 'pending',
+          thread_id text,
+          accepted_at timestamptz not null,
+          started_at timestamptz,
+          completed_at timestamptz,
+          terminal_at timestamptz,
+          artifact_ready_at timestamptz,
+          turn_status text,
+          agent_text text not null default '',
+          recovery_outcome text not null default 'none',
+          final_outcome text not null default 'pending',
+          failure_code text,
+          failure_message text,
+          diagnostics jsonb not null default '{}'::jsonb,
+          result_payload jsonb not null default '{}'::jsonb,
+          created_at timestamptz not null default now(),
+          updated_at timestamptz not null default now()
+        )
+      `);
+      await db.execute(sql`create index if not exists ai_session_turns_session_created_idx on ai_session_turns(session_id, created_at)`);
+      await db.execute(sql`create index if not exists ai_session_turns_session_status_idx on ai_session_turns(session_id, status, updated_at)`);
+      await db.execute(sql`create index if not exists ai_session_turns_session_fingerprint_idx on ai_session_turns(session_id, request_fingerprint, created_at)`);
     })();
   }
 
@@ -219,6 +261,42 @@ function toCheckpointRecord(input: typeof aiSessionCheckpoints.$inferSelect): Ai
     newVersion: input.newVersion,
     status: input.status,
     manifest: (input.manifest ?? {}) as Record<string, unknown>,
+    createdAt: input.createdAt.toISOString(),
+    updatedAt: input.updatedAt.toISOString(),
+  };
+}
+
+function toTurnRecord(input: typeof aiSessionTurns.$inferSelect): AiSessionTurnRecord {
+  return {
+    id: input.id,
+    sessionId: input.sessionId,
+    projectId: input.projectId,
+    workspaceVersion: input.workspaceVersion,
+    workspaceRoot: input.workspaceRoot,
+    mode: input.mode as AiSessionTurnRecord['mode'],
+    requestText: input.requestText,
+    targetId: input.targetId,
+    baseTargetId: input.baseTargetId,
+    routeMode: (input.routeMode ?? null) as AiSessionTurnRecord['routeMode'],
+    routeReason: input.routeReason,
+    allowedPaths: Array.isArray(input.allowedPaths) ? input.allowedPaths.filter((item): item is string => typeof item === 'string') : [],
+    requestFingerprint: input.requestFingerprint,
+    status: input.status as AiSessionTurnRecord['status'],
+    artifactState: input.artifactState as AiSessionTurnRecord['artifactState'],
+    threadId: input.threadId,
+    acceptedAt: input.acceptedAt.toISOString(),
+    startedAt: input.startedAt?.toISOString() ?? null,
+    completedAt: input.completedAt?.toISOString() ?? null,
+    terminalAt: input.terminalAt?.toISOString() ?? null,
+    artifactReadyAt: input.artifactReadyAt?.toISOString() ?? null,
+    turnStatus: input.turnStatus,
+    agentText: input.agentText,
+    recoveryOutcome: input.recoveryOutcome as AiSessionTurnRecord['recoveryOutcome'],
+    finalOutcome: input.finalOutcome as AiSessionTurnRecord['finalOutcome'],
+    failureCode: input.failureCode,
+    failureMessage: input.failureMessage,
+    diagnostics: (input.diagnostics ?? {}) as Record<string, unknown>,
+    resultPayload: (input.resultPayload ?? {}) as Record<string, unknown>,
     createdAt: input.createdAt.toISOString(),
     updatedAt: input.updatedAt.toISOString(),
   };
@@ -426,5 +504,123 @@ export class DrizzleAiSessionRepository implements AiSessionRepository {
       throw new Error(`Failed to create AI session checkpoint ${id}`);
     }
     return toCheckpointRecord(row);
+  }
+
+  async createTurn(input: CreateAiSessionTurnInput): Promise<AiSessionTurnRecord> {
+    await ensureAiSessionSchema();
+    const db = getDb();
+    await db.insert(aiSessionTurns).values({
+      id: input.id,
+      sessionId: input.sessionId,
+      projectId: input.projectId,
+      workspaceVersion: input.workspaceVersion,
+      workspaceRoot: input.workspaceRoot,
+      mode: input.mode,
+      requestText: input.requestText,
+      targetId: input.targetId,
+      baseTargetId: input.baseTargetId,
+      routeMode: input.routeMode,
+      routeReason: input.routeReason,
+      allowedPaths: input.allowedPaths,
+      requestFingerprint: input.requestFingerprint,
+      status: input.status,
+      artifactState: input.artifactState,
+      threadId: input.threadId,
+      acceptedAt: new Date(input.acceptedAt),
+      startedAt: input.startedAt ? new Date(input.startedAt) : null,
+      completedAt: input.completedAt ? new Date(input.completedAt) : null,
+      terminalAt: input.terminalAt ? new Date(input.terminalAt) : null,
+      artifactReadyAt: input.artifactReadyAt ? new Date(input.artifactReadyAt) : null,
+      turnStatus: input.turnStatus,
+      agentText: input.agentText,
+      recoveryOutcome: input.recoveryOutcome,
+      finalOutcome: input.finalOutcome,
+      failureCode: input.failureCode,
+      failureMessage: input.failureMessage,
+      diagnostics: input.diagnostics,
+      resultPayload: input.resultPayload,
+    });
+
+    const created = await this.getTurn(input.id);
+    if (!created) {
+      throw new Error(`Failed to create AI session turn ${input.id}`);
+    }
+    return created;
+  }
+
+  async getTurn(turnId: string): Promise<AiSessionTurnRecord | null> {
+    await ensureAiSessionSchema();
+    const db = getDb();
+    const row = await db.query.aiSessionTurns.findFirst({
+      where: eq(aiSessionTurns.id, turnId),
+    });
+    return row ? toTurnRecord(row) : null;
+  }
+
+  async listSessionTurns(sessionId: string): Promise<AiSessionTurnRecord[]> {
+    await ensureAiSessionSchema();
+    const db = getDb();
+    const rows = await db
+      .select()
+      .from(aiSessionTurns)
+      .where(eq(aiSessionTurns.sessionId, sessionId))
+      .orderBy(asc(aiSessionTurns.createdAt));
+    return rows.map(toTurnRecord);
+  }
+
+  async findActiveTurn(sessionId: string): Promise<AiSessionTurnRecord | null> {
+    await ensureAiSessionSchema();
+    const db = getDb();
+    const rows = await db
+      .select()
+      .from(aiSessionTurns)
+      .where(eq(aiSessionTurns.sessionId, sessionId))
+      .orderBy(asc(aiSessionTurns.createdAt));
+    const active = rows.reverse().find(row => ['submitted', 'running', 'awaiting_artifact'].includes(row.status));
+    return active ? toTurnRecord(active) : null;
+  }
+
+  async findTurnByRequestFingerprint(sessionId: string, requestFingerprint: string): Promise<AiSessionTurnRecord | null> {
+    await ensureAiSessionSchema();
+    const db = getDb();
+    const rows = await db
+      .select()
+      .from(aiSessionTurns)
+      .where(and(eq(aiSessionTurns.sessionId, sessionId), eq(aiSessionTurns.requestFingerprint, requestFingerprint)))
+      .orderBy(asc(aiSessionTurns.createdAt));
+    const turn = rows.at(-1) ?? null;
+    return turn ? toTurnRecord(turn) : null;
+  }
+
+  async updateTurn(turnId: string, input: UpdateAiSessionTurnInput): Promise<AiSessionTurnRecord> {
+    await ensureAiSessionSchema();
+    const db = getDb();
+    await db
+      .update(aiSessionTurns)
+      .set({
+        ...('status' in input ? { status: input.status } : {}),
+        ...('artifactState' in input ? { artifactState: input.artifactState } : {}),
+        ...('threadId' in input ? { threadId: input.threadId ?? null } : {}),
+        ...('startedAt' in input ? { startedAt: input.startedAt ? new Date(input.startedAt) : null } : {}),
+        ...('completedAt' in input ? { completedAt: input.completedAt ? new Date(input.completedAt) : null } : {}),
+        ...('terminalAt' in input ? { terminalAt: input.terminalAt ? new Date(input.terminalAt) : null } : {}),
+        ...('artifactReadyAt' in input ? { artifactReadyAt: input.artifactReadyAt ? new Date(input.artifactReadyAt) : null } : {}),
+        ...('turnStatus' in input ? { turnStatus: input.turnStatus ?? null } : {}),
+        ...('agentText' in input ? { agentText: input.agentText ?? '' } : {}),
+        ...('recoveryOutcome' in input ? { recoveryOutcome: input.recoveryOutcome ?? 'none' } : {}),
+        ...('finalOutcome' in input ? { finalOutcome: input.finalOutcome ?? 'pending' } : {}),
+        ...('failureCode' in input ? { failureCode: input.failureCode ?? null } : {}),
+        ...('failureMessage' in input ? { failureMessage: input.failureMessage ?? null } : {}),
+        ...('diagnostics' in input ? { diagnostics: input.diagnostics ?? {} } : {}),
+        ...('resultPayload' in input ? { resultPayload: input.resultPayload ?? {} } : {}),
+        updatedAt: new Date(),
+      })
+      .where(eq(aiSessionTurns.id, turnId));
+
+    const updated = await this.getTurn(turnId);
+    if (!updated) {
+      throw new Error(`Failed to update AI session turn ${turnId}`);
+    }
+    return updated;
   }
 }

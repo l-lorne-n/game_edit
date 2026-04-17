@@ -1,16 +1,19 @@
 import { NextResponse } from 'next/server';
 
 import {
+  createAiSessionService,
   AiSessionMessageNotReadyError,
   AiSessionTransportNotImplementedError,
   AiSessionTransportNotInitializedError,
 } from '@/lib/ai-sessions/service';
-import { runCodexPackageTask } from '@/lib/ai/codex-package-task';
+import { CodexPackageTaskError, runCodexPackageTask } from '@/lib/ai/codex-package-task';
+import { buildCodexWorkspacePrompt } from '@/lib/ai/codex-workspace-prompts';
 import { computePackageRouteDecision } from '@/lib/ai/package-route-decision';
 import { parseGeneratedGamePackage } from '@/lib/package/contracts';
 import { createProjectService } from '@/lib/projects/service';
 
 const projectService = createProjectService();
+const aiSessionService = createAiSessionService();
 
 export async function POST(request: Request) {
   try {
@@ -35,6 +38,54 @@ export async function POST(request: Request) {
       targetId: '__current__',
       targetPackage: null,
     });
+
+    if (body.aiSessionId) {
+      const turn = await aiSessionService.submitMessageTurn(body.aiSessionId, {
+        mode: 'create',
+        requestText: buildCodexWorkspacePrompt({
+          mode: 'create',
+          prompt,
+          routeMode: serverRouteDecision.routeMode,
+          routeReason: serverRouteDecision.primaryReasonCode,
+          allowedPaths: serverRouteDecision.allowedPaths,
+        }),
+        targetId: '__current__',
+        routeMode: serverRouteDecision.routeMode,
+        routeReason: serverRouteDecision.primaryReasonCode,
+        allowedPaths: serverRouteDecision.allowedPaths,
+      });
+
+      return NextResponse.json(
+        {
+          ok: true,
+          accepted: true,
+          statusMessage: 'Codex turn accepted for async execution.',
+          source: 'model',
+          provider: 'openai',
+          model: 'codex-app-server',
+          repaired: false,
+          fallbackUsed: false,
+          requiresReinit: false,
+          asyncTurn: turn,
+          executionEngine: {
+            requestedEngine: 'codex-app-server',
+            actualEngine: 'codex-app-server',
+            strategy: 'plan_then_execute',
+            routeReason: serverRouteDecision.primaryReasonCode,
+            allowedPaths: serverRouteDecision.allowedPaths,
+            fallbackReason: null,
+            outcome: 'pending',
+            recovery: null,
+            stages: [],
+            failureContext: null,
+          },
+          serverRouteDecision,
+          project: null,
+          persistenceWarning: null,
+        },
+        { status: 202 },
+      );
+    }
 
     const result = await runCodexPackageTask({
       mode: 'create',
@@ -83,6 +134,18 @@ export async function POST(request: Request) {
       persistenceWarning,
     });
   } catch (error) {
+    if (error instanceof CodexPackageTaskError) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: error.message,
+          code: error.code,
+          requiresReinit: error.requiresReinit,
+          executionEngine: error.executionTraceMeta,
+        },
+        { status: error.statusHint },
+      );
+    }
     if (error instanceof AiSessionTransportNotInitializedError || error instanceof AiSessionMessageNotReadyError) {
       return NextResponse.json({ ok: false, error: error.message, code: error.code }, { status: 409 });
     }

@@ -112,4 +112,52 @@ describe('upstash box provider', () => {
     expect(commandMock).toHaveBeenCalledWith('cd "sessions/sess-1" && codex app-server --listen stdio://');
     expect(result).toEqual({ output: 'started', status: 'completed' });
   });
+
+  it('classifies request-level exec timeouts', async () => {
+    process.env.UPSTASH_BOX_API_KEY = 'box-key';
+    process.env.UPSTASH_BOX = 'box_123';
+
+    const timeoutError = new TypeError('fetch failed', {
+      cause: new Error('Headers Timeout Error'),
+    });
+    getMock.mockResolvedValue({
+      exec: {
+        stream: vi.fn().mockRejectedValue(timeoutError),
+      },
+    });
+
+    const provider = new UpstashBoxProvider();
+
+    await expect(provider.execCommand('pwd')).rejects.toMatchObject({
+      code: 'upstash_box_exec_timeout',
+      name: 'UpstashBoxExecError',
+    });
+  });
+
+  it('classifies stream-level exec failures', async () => {
+    process.env.UPSTASH_BOX_API_KEY = 'box-key';
+    process.env.UPSTASH_BOX = 'box_123';
+
+    async function* brokenStream() {
+      yield { type: 'output' as const, data: 'partial' };
+      throw new Error('stream terminated unexpectedly');
+    }
+
+    getMock.mockResolvedValue({
+      exec: {
+        stream: vi.fn().mockResolvedValue({
+          result: '',
+          status: 'running',
+          [Symbol.asyncIterator]: brokenStream,
+        }),
+      },
+    });
+
+    const provider = new UpstashBoxProvider();
+
+    await expect(provider.execCommand('pwd')).rejects.toMatchObject({
+      code: 'upstash_box_exec_stream_failed',
+      name: 'UpstashBoxExecError',
+    });
+  });
 });

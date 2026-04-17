@@ -1,6 +1,7 @@
 import { createProject as createServerProject, listProjects, saveProjectPackage } from '@/lib/projects/client';
 import { snapshotIdFromVersion } from '@/lib/projects/package-files';
 import type { HydratedProjectRecord } from '@/lib/projects/types';
+import type { ExecutionOutcome, RecoveryContext } from '@/lib/ai/execution-trace';
 import { createTemplatePackage } from '@/lib/package/template';
 import {
   createDefaultWorkspace,
@@ -117,6 +118,71 @@ function inferStatusFromEvaluator(evaluator: GameProject['currentEvaluator'] | n
   return evaluator.ok ? 'passed' : 'failed';
 }
 
+function inferExecutionOutcome(trace: GameProject['lastExecutionTrace']): ExecutionOutcome {
+  if (!trace) {
+    return 'direct_success';
+  }
+
+  if (trace.outcome) {
+    return trace.outcome;
+  }
+
+  if (trace.engine?.outcome) {
+    return trace.engine.outcome;
+  }
+
+  if (trace.engine?.fallbackReason === 'workspace_recovered_after_transport_error' || trace.statusMessage.toLowerCase().includes('recovered package from workspace')) {
+    return 'recovered_success';
+  }
+
+  if (trace.failureContext || trace.source === 'request-error' || trace.staticCode === 'REQUEST_FAILED') {
+    return 'hard_failure';
+  }
+
+  return 'direct_success';
+}
+
+function inferRecoveryContext(trace: GameProject['lastExecutionTrace']): RecoveryContext | null {
+  if (!trace) {
+    return null;
+  }
+
+  if (trace.recovery) {
+    return trace.recovery;
+  }
+
+  if (trace.engine?.recovery) {
+    return trace.engine.recovery;
+  }
+
+  if (trace.engine?.fallbackReason === 'workspace_recovered_after_transport_error' || trace.statusMessage.toLowerCase().includes('recovered package from workspace')) {
+    return {
+      source: 'workspace',
+      reason: 'workspace_recovered_after_transport_error',
+      recoveredFromFailureCode: trace.failureContext?.code ?? null,
+      recoveredFromFailureMessage: trace.failureContext?.message ?? null,
+    };
+  }
+
+  return null;
+}
+
+function normalizeExecutionTrace(trace: GameProject['lastExecutionTrace']): GameProject['lastExecutionTrace'] {
+  if (!trace) {
+    return null;
+  }
+
+  return {
+    ...trace,
+    outcome: inferExecutionOutcome(trace),
+    recovery: inferRecoveryContext(trace),
+    stages: trace.stages ?? [],
+    testsRun: trace.testsRun ?? [],
+    filesProduced: trace.filesProduced ?? [],
+    attemptSummaries: trace.attemptSummaries ?? [],
+  };
+}
+
 function toSnapshot(project: HydratedProjectRecord, version: HydratedProjectRecord['versions'][number], cachedProject?: GameProject): ProjectSnapshot {
   const snapshotId = snapshotIdFromVersion(version.version);
   const cachedSnapshot = cachedProject?.snapshots.find(item => item.id === snapshotId) ?? null;
@@ -180,7 +246,7 @@ export function toGameProject(project: HydratedProjectRecord, cachedProject?: Ga
         ? cachedProject.lastGreenSnapshotId
         : snapshots.find(snapshot => snapshot.status === 'passed')?.id ?? null,
     lastRouteDecision: cachedProject?.lastRouteDecision ?? null,
-    lastExecutionTrace: cachedProject?.lastExecutionTrace ?? null,
+    lastExecutionTrace: normalizeExecutionTrace(cachedProject?.lastExecutionTrace ?? null),
   };
 }
 

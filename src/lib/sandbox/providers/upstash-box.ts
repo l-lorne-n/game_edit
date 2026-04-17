@@ -22,16 +22,75 @@ import type {
   UpstashBoxHandle,
 } from '@/lib/sandbox/types';
 
+type ErrorWithCause = Error & { cause?: unknown };
+
+export class UpstashBoxExecError extends Error {
+  constructor(
+    message: string,
+    readonly code: 'upstash_box_exec_timeout' | 'upstash_box_exec_stream_failed' | 'upstash_box_exec_failed',
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+    this.name = 'UpstashBoxExecError';
+  }
+}
+
+function getErrorDetails(error: unknown): string {
+  if (error instanceof Error) {
+    const cause = error as ErrorWithCause;
+    const causeMessage = cause.cause instanceof Error
+      ? cause.cause.message
+      : typeof cause.cause === 'string'
+        ? cause.cause
+        : null;
+    return [error.message, causeMessage].filter(Boolean).join(' ').trim();
+  }
+  return String(error ?? 'Unknown Upstash Box error');
+}
+
+function classifyExecError(error: unknown, phase: 'request' | 'stream'): UpstashBoxExecError {
+  const details = getErrorDetails(error);
+  const lowered = details.toLowerCase();
+
+  if (
+    lowered.includes('timed out')
+    || lowered.includes('timeout')
+    || lowered.includes('etimedout')
+    || lowered.includes('headers timeout')
+    || lowered.includes('body timeout')
+    || lowered.includes('abort')
+  ) {
+    return new UpstashBoxExecError(`Upstash Box command timed out during ${phase}.`, 'upstash_box_exec_timeout', { cause: error });
+  }
+
+  if (
+    phase === 'stream'
+    || lowered.includes('stream')
+    || lowered.includes('terminated')
+    || lowered.includes('premature close')
+    || lowered.includes('socket hang up')
+    || lowered.includes('unexpected end')
+  ) {
+    return new UpstashBoxExecError(`Upstash Box command stream failed during ${phase}.`, 'upstash_box_exec_stream_failed', { cause: error });
+  }
+
+  return new UpstashBoxExecError(`Upstash Box command failed during ${phase}: ${details}`, 'upstash_box_exec_failed', { cause: error });
+}
+
 async function normalizeStreamRunResult(run: {
   status: SandboxCommandResult['status'];
   result: string;
   [Symbol.asyncIterator](): AsyncIterableIterator<ExecStreamChunk>;
 }): Promise<SandboxCommandResult> {
   let output = '';
-  for await (const chunk of run) {
-    if (chunk.type === 'output') {
-      output += chunk.data;
+  try {
+    for await (const chunk of run) {
+      if (chunk.type === 'output') {
+        output += chunk.data;
+      }
     }
+  } catch (error) {
+    throw classifyExecError(error, 'stream');
   }
 
   return {
@@ -81,7 +140,12 @@ export class UpstashBoxProvider implements SandboxProvider {
 
   async execCommand(command: string): Promise<SandboxCommandResult> {
     const box = await this.getBox();
-    const run = await box.exec.stream(command);
+    let run: Awaited<ReturnType<typeof box.exec.stream>>;
+    try {
+      run = await box.exec.stream(command);
+    } catch (error) {
+      throw classifyExecError(error, 'request');
+    }
     return normalizeStreamRunResult(run);
   }
 

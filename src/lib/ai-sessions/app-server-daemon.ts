@@ -29,6 +29,67 @@ type CodexAppServerDaemonResponse = {
   code?: string;
 };
 
+export type CodexAppServerDaemonTurnPhase = 'submitted' | 'running' | 'completed' | 'failed';
+
+export type CodexAppServerDaemonTurnRecord = {
+  turnId: string;
+  phase: CodexAppServerDaemonTurnPhase;
+  submittedAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+  code: string | null;
+  error: string | null;
+  turnStatus: string | null;
+  messages: JsonRpcMessage[];
+  state: CodexAppServerDaemonResponse['state'];
+};
+
+export type CodexAppServerDaemonTurnSubmitResponse = {
+  ok: boolean;
+  deduplicated: boolean;
+  turn: CodexAppServerDaemonTurnRecord;
+  error?: string;
+  code?: string;
+};
+
+type ErrorWithCode = Error & { code?: string; cause?: unknown };
+
+export class CodexAppServerDaemonError extends Error {
+  constructor(message: string, readonly code: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'CodexAppServerDaemonError';
+  }
+}
+
+function getErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error) {
+    return error.message || fallback;
+  }
+  if (typeof error === 'string' && error.trim()) {
+    return error;
+  }
+  return fallback;
+}
+
+function getErrorCode(error: unknown, fallback: string): string {
+  if (error instanceof CodexAppServerDaemonError) {
+    return error.code;
+  }
+  if (error instanceof Error && typeof (error as ErrorWithCode).code === 'string' && (error as ErrorWithCode).code) {
+    return (error as ErrorWithCode).code as string;
+  }
+  return fallback;
+}
+
+function classifyDaemonRequestFailure(status: 'running' | 'completed' | 'failed' | 'cancelled' | 'detached', output: string): CodexAppServerDaemonError {
+  const trimmed = output.trim();
+  const lowered = trimmed.toLowerCase();
+  const code = lowered.includes('timed out') || lowered.includes('timeout')
+    ? 'codex_daemon_request_timeout'
+    : 'codex_daemon_request_failed';
+  return new CodexAppServerDaemonError(trimmed || `Codex daemon request ended with status ${status}.`, code);
+}
+
 function getDaemonRoot(sessionId: string): string {
   return `/workspace/home/${getAiSessionWorkspaceRoot(sessionId)}`;
 }
@@ -42,16 +103,22 @@ export function getAiSessionDaemonPort(sessionId: string): number {
 }
 
 function buildDaemonScript(): string {
-  return `
+  return String.raw`
 import { createServer } from 'node:http';
-import { readFile, unlink } from 'node:fs/promises';
+import { mkdir, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import readline from 'node:readline';
+
+const REFRESH_TIMEOUT_MS = 15000;
 
 const configPath = process.argv[2];
 const raw = await readFile(configPath, 'utf8');
 const config = JSON.parse(raw);
 try { await unlink(configPath); } catch {}
+
+const turnDir = join(config.cwd, '.codex-turns');
+await mkdir(turnDir, { recursive: true });
 
 const child = spawn(config.command, config.args, {
   cwd: config.cwd,
@@ -68,14 +135,127 @@ let currentThreadId = null;
 let materialized = false;
 let childExitError = null;
 let activeRequest = null;
+let activeTurn = null;
 
 function serialize(message) {
-  return JSON.stringify(message) + '\\n';
+  return JSON.stringify(message) + '\n';
+}
+
+function toErrorMessage(error, fallback) {
+  if (error && typeof error.message === 'string' && error.message.trim()) {
+    return error.message;
+  }
+  if (typeof error === 'string' && error.trim()) {
+    return error;
+  }
+  return fallback;
+}
+
+function toErrorCode(error, fallback) {
+  if (error && typeof error.code === 'string' && error.code.trim()) {
+    return error.code;
+  }
+  return fallback;
+}
+
+function getState() {
+  return {
+    initialized,
+    threadId: currentThreadId,
+    materialized,
+    appServerPid: child.pid ?? null,
+  };
+}
+
+function summarizeTurn(turn) {
+  return {
+    turnId: turn.turnId,
+    phase: turn.phase,
+    submittedAt: turn.submittedAt,
+    startedAt: turn.startedAt ?? null,
+    completedAt: turn.completedAt ?? null,
+    code: turn.code ?? null,
+    error: turn.error ?? null,
+    turnStatus: turn.turnStatus ?? null,
+    messages: Array.isArray(turn.messages) ? turn.messages : [],
+    state: turn.state ?? getState(),
+  };
+}
+
+async function persistTurn(turn) {
+  await writeFile(join(turnDir, turn.turnId + '.json'), JSON.stringify(summarizeTurn(turn), null, 2));
+}
+
+async function loadTurn(turnId) {
+  try {
+    const rawTurn = await readFile(join(turnDir, turnId + '.json'), 'utf8');
+    return JSON.parse(rawTurn);
+  } catch {
+    return null;
+  }
+}
+
+async function recoverDanglingTurns() {
+  const entries = await readdir(turnDir).catch(() => []);
+  await Promise.all(entries.filter(entry => entry.endsWith('.json')).map(async entry => {
+    const turnId = entry.slice(0, -5);
+    const turn = await loadTurn(turnId);
+    if (!turn || !['submitted', 'running'].includes(turn.phase)) {
+      return;
+    }
+    turn.phase = 'failed';
+    turn.code = 'daemon_restarted_before_turn_completed';
+    turn.error = 'Codex daemon restarted before the turn completed.';
+    turn.completedAt = new Date().toISOString();
+    turn.state = getState();
+    await persistTurn(turn);
+  }));
+}
+
+await recoverDanglingTurns();
+
+function rejectPending(error) {
+  for (const waiter of pendingResponses.values()) {
+    waiter.reject(error);
+  }
+  pendingResponses.clear();
+  for (const waiters of pendingNotifications.values()) {
+    for (const resolve of waiters) {
+      resolve({ method: 'daemon/error', params: { code: toErrorCode(error, 'daemon_execute_failed'), message: toErrorMessage(error, 'Codex daemon request stopped unexpectedly.') } });
+    }
+  }
+  pendingNotifications.clear();
+}
+
+function captureStructuredError(code, message, details) {
+  capture({
+    method: 'daemon/error',
+    params: {
+      code,
+      message,
+      ...(details ? { details } : {}),
+    },
+  });
+}
+
+function failActiveRequest(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  childExitError = error;
+  captureStructuredError(code, message, null);
+  rejectPending(error);
+  try {
+    child.kill('SIGTERM');
+  } catch {}
+  return error;
 }
 
 function capture(message) {
   if (activeRequest) {
     activeRequest.messages.push(message);
+  }
+  if (activeTurn) {
+    activeTurn.messages.push(message);
   }
 }
 
@@ -88,33 +268,75 @@ function recordThread(message) {
 }
 
 async function refreshExternalTokens(requestId, params) {
-  const response = await fetch(new URL('/api/codex/host/session/refresh', config.hostTokenService.url), {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(config.hostTokenService.apiKey ? { Authorization: 'Bearer ' + config.hostTokenService.apiKey } : {}),
-    },
-    body: JSON.stringify({
-      sessionId: config.hostTokenService.sessionId,
-      previousAccountId: params?.previousAccountId ?? null,
-      reason: params?.reason === 'unauthorized' ? 'unauthorized' : 'unauthorized',
-    }),
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REFRESH_TIMEOUT_MS);
+  try {
+    const response = await fetch(new URL('/api/codex/host/session/refresh', config.hostTokenService.url), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(config.hostTokenService.apiKey ? { Authorization: 'Bearer ' + config.hostTokenService.apiKey } : {}),
+      },
+      body: JSON.stringify({
+        sessionId: config.hostTokenService.sessionId,
+        previousAccountId: params?.previousAccountId ?? null,
+        reason: params?.reason === 'unauthorized' ? 'unauthorized' : 'unauthorized',
+      }),
+      signal: controller.signal,
+    });
 
-  if (!response.ok) {
-    child.stdin.write(serialize({ id: requestId, error: { code: -32002, message: 'Host token refresh failed' } }));
-    return;
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      const message = text || 'Host token refresh failed';
+      captureStructuredError('daemon_external_token_refresh_failed', message, { status: response.status });
+      child.stdin.write(serialize({
+        id: requestId,
+        error: {
+          code: -32002,
+          message,
+          data: {
+            code: 'daemon_external_token_refresh_failed',
+            status: response.status,
+          },
+        },
+      }));
+      return;
+    }
+
+    const json = await response.json();
+    if (!json?.accessToken) {
+      throw Object.assign(new Error('Host token refresh response did not include an access token.'), {
+        code: 'daemon_external_token_refresh_invalid',
+      });
+    }
+
+    child.stdin.write(serialize({
+      id: requestId,
+      result: {
+        accessToken: json.accessToken,
+        chatgptAccountId: json.accountId,
+        chatgptPlanType: json.planType ?? null,
+      },
+    }));
+  } catch (error) {
+    const code = error?.name === 'AbortError'
+      ? 'daemon_external_token_refresh_timeout'
+      : toErrorCode(error, 'daemon_external_token_refresh_failed');
+    const message = error?.name === 'AbortError'
+      ? 'Host token refresh timed out.'
+      : toErrorMessage(error, 'Host token refresh failed.');
+    captureStructuredError(code, message, null);
+    child.stdin.write(serialize({
+      id: requestId,
+      error: {
+        code: -32002,
+        message,
+        data: { code },
+      },
+    }));
+  } finally {
+    clearTimeout(timeout);
   }
-
-  const json = await response.json();
-  child.stdin.write(serialize({
-    id: requestId,
-    result: {
-      accessToken: json.accessToken,
-      chatgptAccountId: json.accountId,
-      chatgptPlanType: json.planType ?? null,
-    },
-  }));
 }
 
 function waitForResponse(id) {
@@ -146,7 +368,45 @@ async function sendMessage(message) {
   return null;
 }
 
-rl.on('line', (line) => {
+async function runTurn(turn, input) {
+  activeTurn = turn;
+  turn.phase = 'running';
+  turn.startedAt = new Date().toISOString();
+  turn.state = getState();
+  await persistTurn(turn);
+
+  const timer = setTimeout(() => {
+    const error = new Error('Daemon timed out waiting for expected notifications.');
+    error.code = 'daemon_execute_timeout';
+    rejectPending(error);
+  }, input.timeoutMs ?? 300000);
+
+  try {
+    for (const message of input.messages) {
+      await sendMessage(message);
+    }
+    for (const method of input.stopOnMethods ?? []) {
+      await waitForNotification(method);
+    }
+    clearTimeout(timer);
+    turn.phase = 'completed';
+    turn.completedAt = new Date().toISOString();
+    turn.state = getState();
+    await persistTurn(turn);
+  } catch (error) {
+    clearTimeout(timer);
+    turn.phase = 'failed';
+    turn.completedAt = new Date().toISOString();
+    turn.code = toErrorCode(error, 'daemon_execute_failed');
+    turn.error = toErrorMessage(error, 'execute failed');
+    turn.state = getState();
+    await persistTurn(turn);
+  } finally {
+    activeTurn = null;
+  }
+}
+
+rl.on('line', line => {
   let msg;
   try {
     msg = JSON.parse(line);
@@ -191,17 +451,21 @@ rl.on('line', (line) => {
   }
 });
 
-errRl.on('line', (line) => {
+errRl.on('line', line => {
   capture({ method: 'stderr', params: { line } });
 });
 
-child.on('error', (error) => {
+child.on('error', error => {
   childExitError = error;
+  rejectPending(error);
 });
 
-child.on('close', (code) => {
+child.on('close', code => {
   if (code && code !== 0) {
     childExitError = new Error('Codex app-server process exited with code ' + code);
+  }
+  if (childExitError) {
+    rejectPending(childExitError);
   }
 });
 
@@ -211,10 +475,8 @@ const server = createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/health') {
     res.end(JSON.stringify({
       ok: !childExitError,
-      initialized,
-      threadId: currentThreadId,
-      materialized,
-      appServerPid: child.pid ?? null,
+      ...getState(),
+      activeTurnId: activeTurn?.turnId ?? null,
       error: childExitError ? String(childExitError.message ?? childExitError) : null,
     }));
     return;
@@ -228,9 +490,9 @@ const server = createServer(async (req, res) => {
   }
 
   if (req.method === 'POST' && req.url === '/execute') {
-    if (activeRequest) {
+    if (activeRequest || activeTurn) {
       res.statusCode = 409;
-      res.end(JSON.stringify({ ok: false, code: 'daemon_busy', error: 'A turn is already in flight.', state: { initialized, threadId: currentThreadId, materialized, appServerPid: child.pid ?? null }, messages: [] }));
+      res.end(JSON.stringify({ ok: false, code: 'daemon_busy', error: 'A turn is already in flight.', state: getState(), messages: [] }));
       return;
     }
 
@@ -239,7 +501,7 @@ const server = createServer(async (req, res) => {
     const input = JSON.parse(body);
     activeRequest = { messages: [] };
     const timer = setTimeout(() => {
-      activeRequest?.messages.push({ method: 'error', params: { message: 'Daemon timed out waiting for expected notifications.' } });
+      failActiveRequest('daemon_execute_timeout', 'Daemon timed out waiting for expected notifications.');
     }, input.timeoutMs ?? 60000);
 
     try {
@@ -253,12 +515,7 @@ const server = createServer(async (req, res) => {
       const response = {
         ok: !childExitError,
         messages: activeRequest.messages,
-        state: {
-          initialized,
-          threadId: currentThreadId,
-          materialized,
-          appServerPid: child.pid ?? null,
-        },
+        state: getState(),
         error: childExitError ? String(childExitError.message ?? childExitError) : undefined,
       };
       activeRequest = null;
@@ -266,23 +523,80 @@ const server = createServer(async (req, res) => {
       return;
     } catch (error) {
       clearTimeout(timer);
+      const code = toErrorCode(error, 'daemon_execute_failed');
       const response = {
         ok: false,
-        code: 'daemon_execute_failed',
-        error: String(error?.message ?? error ?? 'execute failed'),
+        code,
+        error: toErrorMessage(error, 'execute failed'),
         messages: activeRequest.messages,
-        state: {
-          initialized,
-          threadId: currentThreadId,
-          materialized,
-          appServerPid: child.pid ?? null,
-        },
+        state: getState(),
       };
       activeRequest = null;
-      res.statusCode = 500;
+      res.statusCode = code === 'daemon_execute_timeout' ? 504 : 500;
       res.end(JSON.stringify(response));
       return;
     }
+  }
+
+  if (req.method === 'POST' && req.url === '/turns/submit') {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    const input = JSON.parse(body);
+    const persisted = await loadTurn(input.turnId);
+    if (persisted) {
+      res.end(JSON.stringify({ ok: true, deduplicated: true, turn: persisted }));
+      return;
+    }
+    if (activeRequest || (activeTurn && activeTurn.turnId !== input.turnId)) {
+      res.statusCode = 409;
+      res.end(JSON.stringify({ ok: false, code: 'daemon_busy', error: 'A turn is already in flight.', turn: activeTurn ? summarizeTurn(activeTurn) : null }));
+      return;
+    }
+    const turn = {
+      turnId: input.turnId,
+      phase: 'submitted',
+      submittedAt: new Date().toISOString(),
+      startedAt: null,
+      completedAt: null,
+      code: null,
+      error: null,
+      turnStatus: null,
+      messages: [],
+      state: getState(),
+    };
+    await persistTurn(turn);
+    void runTurn(turn, input);
+    res.end(JSON.stringify({ ok: true, deduplicated: false, turn: summarizeTurn(turn) }));
+    return;
+  }
+
+  const turnStatusMatch = req.url?.match(/^\/turns\/([^/]+)\/status$/);
+  if (req.method === 'GET' && turnStatusMatch) {
+    const turn = await loadTurn(decodeURIComponent(turnStatusMatch[1]));
+    if (!turn) {
+      res.statusCode = 404;
+      res.end(JSON.stringify({ ok: false, code: 'turn_not_found', error: 'Turn not found.' }));
+      return;
+    }
+    res.end(JSON.stringify({ ok: true, turn }));
+    return;
+  }
+
+  const turnResultMatch = req.url?.match(/^\/turns\/([^/]+)\/result$/);
+  if (req.method === 'GET' && turnResultMatch) {
+    const turn = await loadTurn(decodeURIComponent(turnResultMatch[1]));
+    if (!turn) {
+      res.statusCode = 404;
+      res.end(JSON.stringify({ ok: false, code: 'turn_not_found', error: 'Turn not found.' }));
+      return;
+    }
+    if (!['completed', 'failed'].includes(turn.phase)) {
+      res.statusCode = 409;
+      res.end(JSON.stringify({ ok: false, code: 'turn_not_ready', error: 'Turn has not completed yet.', turn }));
+      return;
+    }
+    res.end(JSON.stringify({ ok: true, turn }));
+    return;
   }
 
   res.statusCode = 404;
@@ -332,23 +646,19 @@ export async function ensureCodexAppServerDaemon(
     return;
   }
 
+  if (health.output.trim()) {
+    await sandboxProvider.execCommand(`curl -s -X POST http://127.0.0.1:${getAiSessionDaemonPort(sessionId)}/shutdown || true`);
+  }
+
   await sandboxProvider.writeFiles([
     { path: getDaemonScriptPath(sessionId), content: buildDaemonScript() },
     { path: getDaemonConfigPath(sessionId), content: buildDaemonConfig(sessionId, config, cwd, hostTokenService) },
   ]);
-  await sandboxProvider.execCommand(
-    `cd ${JSON.stringify(root)} && nohup node .codex-daemon.mjs ./.codex-daemon-config.json > ./.codex-daemon.out 2>&1 &`,
-  );
-  const waitResult = await sandboxProvider.execCommand(
-    `for i in 1 2 3 4 5 6 7 8 9 10; do curl -sf http://127.0.0.1:${getAiSessionDaemonPort(sessionId)}/health && exit 0; sleep 1; done; exit 1`,
-  );
+  await sandboxProvider.execCommand(`cd ${JSON.stringify(root)} && nohup node .codex-daemon.mjs ./.codex-daemon-config.json > ./.codex-daemon.out 2>&1 &`);
+  const waitResult = await sandboxProvider.execCommand(`for i in 1 2 3 4 5 6 7 8 9 10; do out=$(curl -s http://127.0.0.1:${getAiSessionDaemonPort(sessionId)}/health || true); printf "%s" "$out" | grep -q '"ok":true' && exit 0; sleep 1; done; exit 1`);
   if (waitResult.status !== 'completed') {
-    const daemonOutput = await sandboxProvider.execCommand(
-      `cd ${JSON.stringify(root)} && if [ -f ./.codex-daemon.out ]; then cat ./.codex-daemon.out; fi`,
-    );
-    throw new Error(
-      `Failed to start long-lived Codex app-server daemon.${daemonOutput.output ? ` Daemon output: ${daemonOutput.output}` : ''}`,
-    );
+    const daemonOutput = await sandboxProvider.execCommand(`cd ${JSON.stringify(root)} && if [ -f ./.codex-daemon.out ]; then cat ./.codex-daemon.out; fi`);
+    throw new Error(`Failed to start long-lived Codex app-server daemon.${daemonOutput.output ? ` Daemon output: ${daemonOutput.output}` : ''}`);
   }
 }
 
@@ -357,16 +667,93 @@ export async function callCodexAppServerDaemon(
   sessionId: string,
   request: CodexAppServerDaemonRequest,
 ): Promise<CodexAppServerDaemonResponse> {
-  await sandboxProvider.writeFiles([
-    { path: getDaemonRequestPath(sessionId), content: JSON.stringify(request) },
-  ]);
-  const result = await sandboxProvider.execCommand(
-    `cd ${JSON.stringify(getDaemonRoot(sessionId))} && curl -s -X POST -H "Content-Type: application/json" --data @./.codex-daemon-request.json http://127.0.0.1:${getAiSessionDaemonPort(sessionId)}/execute`,
-  );
-  if (!result.output.trim()) {
-    throw new Error('Codex daemon returned an empty response.');
+  await sandboxProvider.writeFiles([{ path: getDaemonRequestPath(sessionId), content: JSON.stringify(request) }]);
+  let result;
+  try {
+    result = await sandboxProvider.execCommand(`cd ${JSON.stringify(getDaemonRoot(sessionId))} && curl -sS -X POST -H "Content-Type: application/json" --data @./.codex-daemon-request.json http://127.0.0.1:${getAiSessionDaemonPort(sessionId)}/execute`);
+  } catch (error) {
+    throw new CodexAppServerDaemonError(getErrorMessage(error, 'Codex daemon request failed.'), getErrorCode(error, 'codex_daemon_request_failed'), { cause: error });
   }
-  return JSON.parse(result.output) as CodexAppServerDaemonResponse;
+  if (result.status !== 'completed') {
+    throw classifyDaemonRequestFailure(result.status, result.output);
+  }
+  if (!result.output.trim()) {
+    throw new CodexAppServerDaemonError('Codex daemon returned an empty response.', 'codex_daemon_empty_response');
+  }
+  try {
+    return JSON.parse(result.output) as CodexAppServerDaemonResponse;
+  } catch (error) {
+    throw new CodexAppServerDaemonError('Codex daemon returned invalid JSON.', 'codex_daemon_invalid_response', { cause: error });
+  }
+}
+
+async function readDaemonJson<T>(sandboxProvider: SandboxProvider, command: string): Promise<T> {
+  const result = await sandboxProvider.execCommand(command);
+  if (result.status !== 'completed') {
+    throw classifyDaemonRequestFailure(result.status, result.output);
+  }
+  if (!result.output.trim()) {
+    throw new CodexAppServerDaemonError('Codex daemon returned an empty response.', 'codex_daemon_empty_response');
+  }
+  try {
+    return JSON.parse(result.output) as T;
+  } catch (error) {
+    throw new CodexAppServerDaemonError('Codex daemon returned invalid JSON.', 'codex_daemon_invalid_response', { cause: error });
+  }
+}
+
+export async function submitCodexAppServerDaemonTurn(
+  sandboxProvider: SandboxProvider,
+  sessionId: string,
+  request: CodexAppServerDaemonRequest & { turnId: string },
+): Promise<CodexAppServerDaemonTurnSubmitResponse> {
+  await sandboxProvider.writeFiles([{ path: getDaemonRequestPath(sessionId), content: JSON.stringify(request) }]);
+  return readDaemonJson<CodexAppServerDaemonTurnSubmitResponse>(
+    sandboxProvider,
+    `cd ${JSON.stringify(getDaemonRoot(sessionId))} && curl -sS -X POST -H "Content-Type: application/json" --data @./.codex-daemon-request.json http://127.0.0.1:${getAiSessionDaemonPort(sessionId)}/turns/submit`,
+  );
+}
+
+export async function getCodexAppServerDaemonTurnStatus(
+  sandboxProvider: SandboxProvider,
+  sessionId: string,
+  turnId: string,
+): Promise<CodexAppServerDaemonTurnRecord | null> {
+  const encodedTurnId = encodeURIComponent(turnId);
+  const response = await readDaemonJson<{ ok: boolean; turn?: CodexAppServerDaemonTurnRecord; code?: string }>(
+    sandboxProvider,
+    `curl -sS http://127.0.0.1:${getAiSessionDaemonPort(sessionId)}/turns/${encodedTurnId}/status`,
+  ).catch(error => {
+    if (error instanceof CodexAppServerDaemonError && error.code === 'codex_daemon_empty_response') {
+      return { ok: false };
+    }
+    throw error;
+  });
+  if (!('turn' in response) || !response.ok || !response.turn) {
+    return null;
+  }
+  return response.turn;
+}
+
+export async function getCodexAppServerDaemonTurnResult(
+  sandboxProvider: SandboxProvider,
+  sessionId: string,
+  turnId: string,
+): Promise<CodexAppServerDaemonTurnRecord | null> {
+  const encodedTurnId = encodeURIComponent(turnId);
+  const response = await readDaemonJson<{ ok: boolean; turn?: CodexAppServerDaemonTurnRecord; code?: string }>(
+    sandboxProvider,
+    `curl -sS http://127.0.0.1:${getAiSessionDaemonPort(sessionId)}/turns/${encodedTurnId}/result`,
+  ).catch(error => {
+    if (error instanceof CodexAppServerDaemonError && error.code === 'codex_daemon_empty_response') {
+      return { ok: false };
+    }
+    throw error;
+  });
+  if (!('turn' in response) || !response.ok || !response.turn) {
+    return null;
+  }
+  return response.turn;
 }
 
 export async function getCodexAppServerDaemonHealth(

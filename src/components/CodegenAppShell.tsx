@@ -2,12 +2,24 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 
+import {
+  buildClientFailureContext,
+  createExecutionStage,
+  upsertExecutionStage,
+  type ExecutionOutcome,
+  type ExecutionStage,
+  type FailureContext,
+  type PackageExecutionTraceMeta,
+  type RecoveryContext,
+} from '@/lib/ai/execution-trace';
 import type { ModelAttempt } from '@/lib/ai/types';
 import {
   AiSessionClientError,
   beginHostBrowserOAuth,
   checkpointAiSession,
   createAiSession,
+  getAiSessionMessageTurnResult,
+  getAiSessionMessageTurnStatus,
   getAiSessionLogs,
   getAiSessionSnapshot,
   getLatestHostTokenSession,
@@ -56,8 +68,41 @@ import SandboxPreview from '@/components/SandboxPreview';
 import CodexPanel from '@/components/CodexPanel';
 import styles from '@/components/CodegenAppShell.module.css';
 
-type PackageApiSuccess = {
+type AsyncTurnResponse = {
+  acknowledged: true;
+  deduplicated?: boolean;
+  sessionId: string;
+  turnId: string;
+  acceptedAt: string;
+  threadId: string;
+  workspaceVersion: number;
+  workspaceRoot: string;
+  baseTargetId: string | null;
+  status: string;
+  artifactState: string;
+};
+
+type PackageApiAccepted = {
   ok: true;
+  accepted: true;
+  statusMessage: string;
+  source: string;
+  provider: string;
+  model: string;
+  repaired: boolean;
+  fallbackUsed: boolean;
+  requiresReplan?: boolean;
+  requiresReinit?: boolean;
+  executionEngine?: PackageExecutionTraceMeta;
+  serverRouteDecision?: RouteDecision;
+  project: import('@/lib/projects/types').HydratedProjectRecord | null;
+  persistenceWarning?: string | null;
+  asyncTurn: AsyncTurnResponse;
+};
+
+type PackageApiCompleted = {
+  ok: true;
+  accepted?: false;
   package: GeneratedGamePackage;
   manifest: GamePackageManifest;
   staticEvaluation: EvaluatorResult;
@@ -69,14 +114,8 @@ type PackageApiSuccess = {
   model: string;
   attempts: ModelAttempt[];
   requiresReplan?: boolean;
-  executionEngine?: {
-    requestedEngine: string;
-    actualEngine: string;
-    strategy: string;
-    routeReason: string | null;
-    allowedPaths: string[];
-    fallbackReason: string | null;
-  };
+  requiresReinit?: boolean;
+  executionEngine?: PackageExecutionTraceMeta;
   serverRouteDecision?: RouteDecision;
   project: import('@/lib/projects/types').HydratedProjectRecord | null;
   persistenceWarning?: string | null;
@@ -86,7 +125,11 @@ type PackageApiFailure = {
   ok: false;
   error: string;
   code?: string;
+  requiresReinit?: boolean;
+  executionEngine?: PackageExecutionTraceMeta;
 };
+
+type PackageApiSuccess = PackageApiAccepted | PackageApiCompleted;
 
 type ApiResponse = PackageApiSuccess | PackageApiFailure;
 
@@ -200,6 +243,95 @@ function plausibleDebugTargets(project: GameProject): string[] {
   return [...ids];
 }
 
+function mergeExecutionStages(base: ExecutionStage[] | null | undefined, additions: ExecutionStage[]): ExecutionStage[] {
+  return additions.reduce((merged, stage) => upsertExecutionStage(merged, stage), base ?? []);
+}
+
+function buildStageDetailFromFailure(input: {
+  response: PackageApiFailure;
+  fallback: FailureContext;
+}): FailureContext {
+  return input.response.executionEngine?.failureContext ?? input.fallback;
+}
+
+function getExecutionOutcome(engine: PackageExecutionTraceMeta | null | undefined, ok: boolean): ExecutionOutcome {
+  if (!ok) {
+    return 'hard_failure';
+  }
+  return engine?.outcome ?? 'direct_success';
+}
+
+function getRecoveryContext(engine: PackageExecutionTraceMeta | null | undefined): RecoveryContext | null {
+  return engine?.recovery ?? null;
+}
+
+function formatOutcomeLabel(outcome: ExecutionOutcome): string {
+  switch (outcome) {
+    case 'pending':
+      return '进行中';
+    case 'recovered_success':
+      return '恢复成功';
+    case 'hard_failure':
+      return '失败';
+    case 'direct_success':
+    default:
+      return '直接成功';
+  }
+}
+
+function buildAssistantSummary(input: {
+  outcome: ExecutionOutcome;
+  statusMessage: string;
+  source: string;
+  provider: string;
+  model: string;
+  repaired: boolean;
+  fallbackUsed: boolean;
+  requiresReplan?: boolean;
+  persistenceWarning?: string | null;
+  staticCode: string;
+  engine?: PackageExecutionTraceMeta | null;
+  failureContext?: FailureContext | null;
+  recovery?: RecoveryContext | null;
+  fallbackReason?: string | null;
+}): string {
+  const recoverySource = input.recovery
+    ? [
+        `source=${input.recovery.source}`,
+        typeof input.recovery.workspaceVersion === 'number' ? `workspace=v${input.recovery.workspaceVersion}` : null,
+        input.recovery.reason,
+      ]
+        .filter(Boolean)
+        .join(' | ')
+    : null;
+
+  return [
+    `Outcome: ${formatOutcomeLabel(input.outcome)}`,
+    `Status: ${input.statusMessage}`,
+    input.outcome === 'recovered_success' && input.failureContext
+      ? `Original failure: ${input.failureContext.code ?? input.failureContext.reason ?? 'unknown'} | ${input.failureContext.message}`
+      : null,
+    recoverySource ? `Recovery source: ${recoverySource}` : null,
+    `Source: ${input.source}`,
+    `Provider/Model: ${input.provider} / ${input.model}`,
+    `Repaired: ${String(input.repaired)} | Fallback: ${String(input.fallbackUsed)}`,
+    input.requiresReplan ? 'Route: replan required' : null,
+    input.engine
+      ? `Engine requested/actual/strategy: ${input.engine.requestedEngine} / ${input.engine.actualEngine} / ${input.engine.strategy}`
+      : null,
+    input.engine?.fallbackReason ? `Engine fallback: ${input.engine.fallbackReason}` : null,
+    input.fallbackReason ? `Fallback reason: ${input.fallbackReason}` : null,
+    `Static: ${input.staticCode}`,
+    input.persistenceWarning ? `Persistence: ${input.persistenceWarning}` : null,
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+function isTerminalAsyncTurnState(state: string | null | undefined): boolean {
+  return state === 'completed' || state === 'failed' || state === 'rejected';
+}
+
 function getHeadVersion(project: GameProject): number {
   const versions = project.snapshots
     .map(snapshot => versionFromSnapshotId(snapshot.id))
@@ -254,6 +386,7 @@ export default function CodegenAppShell() {
     tester: 0,
     checker: 0,
   });
+  const finalizeAsyncTurnRef = useRef<(projectId: string, turnId: string) => Promise<void>>(async () => undefined);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
   const activeProject = useMemo(() => (workspace ? getActiveProject(workspace) : null), [workspace]);
@@ -366,6 +499,84 @@ export default function CodegenAppShell() {
     });
   }, [workspace, workspaceReady]);
 
+  useEffect(() => {
+    if (!activeProject || !activeAiSessionId) {
+      return;
+    }
+
+    const activeTurnId = activeProject.lastExecutionTrace?.turnId ?? null;
+    const activeTurnState = activeProject.lastExecutionTrace?.turnState ?? null;
+    if (!activeTurnId || isTerminalAsyncTurnState(activeTurnState)) {
+      return;
+    }
+
+    let cancelled = false;
+    let timeoutId: number | null = null;
+
+    const poll = async () => {
+      try {
+        const status = await getAiSessionMessageTurnStatus(activeAiSessionId, activeTurnId);
+        if (cancelled) {
+          return;
+        }
+
+        setWorkspace(prev =>
+          prev
+            ? updateProject(prev, activeProject.id, project => ({
+                ...project,
+                lastExecutionTrace: project.lastExecutionTrace
+                  ? {
+                      ...project.lastExecutionTrace,
+                      turnId: status.turnId,
+                      turnState: status.status,
+                      artifactState: status.artifactState,
+                      acceptedAt: status.acceptedAt,
+                      statusMessage: status.failureMessage ?? project.lastExecutionTrace.statusMessage,
+                    }
+                  : project.lastExecutionTrace,
+              }))
+            : prev,
+        );
+
+        if (!isTerminalAsyncTurnState(status.status)) {
+          const generatorLabel = activeProject.lastRouteDecision ? labelForAgent(activeProject.lastRouteDecision.agent) : '生成器';
+          const elapsed = status.acceptedAt ? Math.max(0, Date.now() - Date.parse(status.acceptedAt)) : 0;
+          setPhases([
+            {
+              id: 'generator',
+              label: generatorLabel,
+              state: activeProject.lastMode === 'debug' ? 'repairing' : 'running',
+              detail: `Async turn ${status.status} (artifact: ${status.artifactState})`,
+              elapsedMs: elapsed,
+            },
+            { id: 'tester', label: '测试者', state: 'idle', detail: '等待生成完成', elapsedMs: 0 },
+            { id: 'checker', label: '检查者', state: 'idle', detail: '等待最终结果', elapsedMs: 0 },
+          ]);
+        }
+
+        if (isTerminalAsyncTurnState(status.status)) {
+          await finalizeAsyncTurnRef.current(activeProject.id, activeTurnId);
+          return;
+        }
+      } catch {
+        // keep polling for transient request failures
+      }
+
+      timeoutId = window.setTimeout(() => {
+        void poll();
+      }, 1000);
+    };
+
+    void poll();
+
+    return () => {
+      cancelled = true;
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [activeAiSessionId, activeProject]);
+
   function mutateActiveProject(updater: (project: GameProject) => GameProject): void {
     if (!activeProject) {
       return;
@@ -413,6 +624,134 @@ export default function CodegenAppShell() {
       [projectId]: logs,
     }));
   }
+
+  async function finalizeAsyncTurn(projectId: string, turnId: string): Promise<void> {
+    if (!activeAiSessionId) {
+      return;
+    }
+
+    const result = await getAiSessionMessageTurnResult(activeAiSessionId, turnId);
+    const routeDecision = activeProject?.lastRouteDecision ?? null;
+    const generatorLabel = routeDecision ? labelForAgent(routeDecision.agent) : '生成器';
+    const failureContext = (result.executionEngine?.failureContext as FailureContext | null | undefined) ?? null;
+
+    if (result.finalOutcome === 'failed' || !result.package || !result.staticEvaluation || !result.manifest) {
+      const message = result.failureMessage ?? result.statusMessage;
+      const elapsed = result.acceptedAt ? Math.max(0, Date.now() - Date.parse(result.acceptedAt)) : 0;
+      setPhases([
+        {
+          id: 'generator',
+          label: generatorLabel,
+          state: 'failed',
+          detail: message,
+          elapsedMs: elapsed,
+        },
+        { id: 'tester', label: '测试者', state: 'failed', detail: '跳过：生成失败', elapsedMs: 0 },
+        { id: 'checker', label: '检查者', state: 'failed', detail: '请求失败', elapsedMs: 0 },
+      ]);
+
+      setWorkspace(prev =>
+        prev
+          ? updateProject(prev, projectId, project => ({
+              ...appendMessages(project, [
+                makeChatMessage({
+                  role: 'assistant',
+                  mode: project.lastMode,
+                  text: buildAssistantSummary({
+                    outcome: 'hard_failure',
+                    statusMessage: message,
+                    source: 'request-error',
+                    provider: result.provider,
+                    model: result.model,
+                    repaired: result.repaired,
+                    fallbackUsed: result.fallbackUsed,
+                    staticCode: 'REQUEST_FAILED',
+                    engine: result.executionEngine ?? null,
+                    failureContext,
+                    recovery: null,
+                  }),
+                }),
+              ]),
+              lastExecutionTrace: project.lastExecutionTrace
+                ? {
+                    ...project.lastExecutionTrace,
+                    outcome: 'hard_failure',
+                    turnState: 'failed',
+                    artifactState: result.artifactState,
+                    statusMessage: message,
+                    engine: (result.executionEngine as PackageExecutionTraceMeta | null | undefined) ?? null,
+                    failureContext,
+                  }
+                : project.lastExecutionTrace,
+            }))
+          : prev,
+      );
+      return;
+    }
+
+    const generatedPackage = result.package;
+    const staticEvaluation = result.staticEvaluation;
+    const outcome = getExecutionOutcome((result.executionEngine as PackageExecutionTraceMeta | null | undefined) ?? null, true);
+    const recovery = getRecoveryContext((result.executionEngine as PackageExecutionTraceMeta | null | undefined) ?? null);
+    const summary = buildAssistantSummary({
+      outcome,
+      statusMessage: result.statusMessage,
+      source: result.source,
+      provider: result.provider,
+      model: result.model,
+      repaired: result.repaired,
+      fallbackUsed: result.fallbackUsed,
+      staticCode: staticEvaluation.code,
+      engine: (result.executionEngine as PackageExecutionTraceMeta | null | undefined) ?? null,
+      failureContext,
+      recovery,
+    });
+
+    const elapsed = result.acceptedAt ? Math.max(0, Date.now() - Date.parse(result.acceptedAt)) : 0;
+    phaseStartedRef.current.tester = nowMs();
+    phaseStartedRef.current.checker = phaseStartedRef.current.tester;
+    setPhases([
+      { id: 'generator', label: generatorLabel, state: 'passed', detail: '异步生成完成，已加载版本包', elapsedMs: elapsed },
+      { id: 'tester', label: '测试者', state: 'running', detail: '等待 sandbox READY + runTests', elapsedMs: 0 },
+      { id: 'checker', label: '检查者', state: 'running', detail: '等待测试结论', elapsedMs: 0 },
+    ]);
+
+    setWorkspace(prev => {
+      if (!prev) {
+        return prev;
+      }
+      return updateProject(prev, projectId, project => ({
+        ...appendMessages(project, [
+          makeChatMessage({ role: 'assistant', mode: project.lastMode, text: summary }),
+        ]),
+        currentPackage: generatedPackage,
+        currentEvaluator: staticEvaluation,
+        selectedModifyBaseId: '__current__',
+        selectedDebugTargetId: '__current__',
+        lastExecutionTrace: project.lastExecutionTrace
+          ? {
+              ...project.lastExecutionTrace,
+              outcome,
+              recovery,
+              turnState: 'completed',
+              artifactState: result.artifactState,
+              statusMessage: result.statusMessage,
+              source: result.source,
+              provider: result.provider,
+              model: result.model,
+              repaired: result.repaired,
+              fallbackUsed: result.fallbackUsed,
+              staticCode: staticEvaluation.code,
+              engine: (result.executionEngine as PackageExecutionTraceMeta | null | undefined) ?? null,
+              failureContext,
+            }
+          : project.lastExecutionTrace,
+      }));
+    });
+    setRuntimeNonce(prev => prev + 1);
+  }
+
+  finalizeAsyncTurnRef.current = finalizeAsyncTurn;
 
   async function ensureAiSessionReadyForSend(projectId: string): Promise<string> {
     let session = activeAiSession;
@@ -927,19 +1266,62 @@ export default function CodegenAppShell() {
     setBusy(true);
 
     let ensuredAiSessionId: string | undefined;
+    let sessionPrepareStage: ExecutionStage | null = null;
     if (isServerBackedProject(activeProject)) {
+      const sessionPrepareStartedAt = nowMs();
       try {
         ensuredAiSessionId = await ensureAiSessionReadyForSend(activeProject.id);
+        sessionPrepareStage = createExecutionStage({
+          key: 'session_prepare',
+          status: 'completed',
+          durationMs: Math.max(0, nowMs() - sessionPrepareStartedAt),
+          detail: 'Codex session prepared for the next request.',
+        });
       } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const code = error instanceof AiSessionClientError ? error.code ?? undefined : undefined;
+        sessionPrepareStage = createExecutionStage({
+          key: 'session_prepare',
+          status: 'failed',
+          durationMs: Math.max(0, nowMs() - sessionPrepareStartedAt),
+          detail: message,
+        });
         mutateActiveProject(project =>
           appendMessages(project, [
             makeChatMessage({
               role: 'assistant',
               mode,
-              text: `Request failed before send: ${error instanceof Error ? error.message : String(error)}`,
+              text: `Request failed before send: ${message}`,
             }),
           ]),
         );
+        mutateActiveProject(project => ({
+          ...project,
+          lastExecutionTrace: {
+            requestMode: mode,
+            endpoint: 'session-prepare',
+            targetId: activeProject.selectedSnapshotId || '__current__',
+            roleLabel: 'Codex session',
+            statusMessage: message,
+            source: 'request-error',
+            provider: '-',
+            model: '-',
+            repaired: false,
+            fallbackUsed: false,
+            staticCode: 'REQUEST_FAILED',
+            testsRun: [],
+            filesProduced: [],
+            engine: null,
+            stages: sessionPrepareStage ? [sessionPrepareStage] : [],
+            failureContext: buildClientFailureContext({
+              checkpoint: 'request_setup',
+              error: message,
+              code,
+              reason: 'session_prepare_failed',
+            }),
+            attemptSummaries: [],
+          },
+        }));
         setBusy(false);
         return;
       }
@@ -1060,11 +1442,25 @@ export default function CodegenAppShell() {
       (error): PackageApiFailure => ({
         ok: false,
         error: error instanceof Error ? error.message : String(error),
+        executionEngine: undefined,
       }),
     );
 
     if (!response.ok) {
       const elapsed = Math.max(0, nowMs() - phaseStartedRef.current.generator);
+      const failureStages = mergeExecutionStages(
+        sessionPrepareStage ? [sessionPrepareStage] : [],
+        response.executionEngine?.stages ?? [],
+      );
+      const failureContext = buildStageDetailFromFailure({
+        response,
+        fallback: buildClientFailureContext({
+          checkpoint: 'request_send',
+          error: response.error,
+          code: response.code,
+          reason: response.code ?? 'request_failed',
+        }),
+      });
       setPhases([
         {
           id: 'generator',
@@ -1095,7 +1491,19 @@ export default function CodegenAppShell() {
             makeChatMessage({
               role: 'assistant',
               mode,
-              text: `Request failed: ${response.error}`,
+              text: buildAssistantSummary({
+                outcome: 'hard_failure',
+                statusMessage: response.error,
+                source: 'request-error',
+                provider: '-',
+                model: '-',
+                repaired: false,
+                fallbackUsed: false,
+                staticCode: 'REQUEST_FAILED',
+                engine: response.executionEngine ?? null,
+                failureContext,
+                recovery: null,
+              }),
             }),
           ]),
           lastExecutionTrace: {
@@ -1103,52 +1511,145 @@ export default function CodegenAppShell() {
             endpoint,
             targetId: clientRouteDecision.targetId,
             roleLabel: generatorLabel,
+            outcome: 'hard_failure',
+            recovery: null,
             statusMessage: response.error,
             source: 'request-error',
             provider: '-',
             model: '-',
             repaired: false,
             fallbackUsed: false,
-          staticCode: 'REQUEST_FAILED',
-          testsRun: [],
-          filesProduced: [],
-          attemptSummaries: [],
-        } as ExecutionTrace,
-      }),
+            staticCode: 'REQUEST_FAILED',
+            testsRun: [],
+            filesProduced: [],
+            engine: response.executionEngine ?? null,
+            stages: failureStages,
+            failureContext,
+            attemptSummaries: [],
+          },
+        }),
       );
       setBusy(false);
       return;
     }
 
+      if (response.accepted) {
+        const routeDecision = response.serverRouteDecision ?? clientRouteDecision;
+        const outcome: ExecutionOutcome = 'pending';
+        const summary = buildAssistantSummary({
+          outcome,
+          statusMessage: response.statusMessage,
+          source: response.source,
+          provider: response.provider,
+          model: response.model,
+          repaired: response.repaired,
+          fallbackUsed: response.fallbackUsed,
+          requiresReplan: response.requiresReplan,
+          persistenceWarning: response.persistenceWarning,
+          staticCode: 'TURN_ACCEPTED',
+          engine: response.executionEngine ?? null,
+          failureContext: null,
+          recovery: null,
+        });
+        const elapsed = Math.max(0, nowMs() - phaseStartedRef.current.generator);
+        setPhases([
+          {
+            id: 'generator',
+            label: generatorLabel,
+            state: mode === 'debug' ? 'repairing' : 'running',
+            detail: `Turn accepted (${response.asyncTurn.turnId}). Waiting for async completion...`,
+            elapsedMs: elapsed,
+          },
+          {
+            id: 'tester',
+            label: '测试者',
+            state: 'idle',
+            detail: '等待生成完成',
+            elapsedMs: 0,
+          },
+          {
+            id: 'checker',
+            label: '检查者',
+            state: 'idle',
+            detail: '等待最终结果',
+            elapsedMs: 0,
+          },
+        ]);
+
+        mutateActiveProject(project => ({
+          ...appendMessages(project, [
+            makeChatMessage({
+              role: 'assistant',
+              mode,
+              text: summary,
+            }),
+          ]),
+          lastMode: mode,
+          lastRouteDecision: routeDecision,
+          lastExecutionTrace: {
+            requestMode: mode,
+            endpoint,
+            targetId: routeDecision.targetId,
+            roleLabel: generatorLabel,
+            outcome,
+            recovery: null,
+            turnId: response.asyncTurn.turnId,
+            turnState: response.asyncTurn.status,
+            artifactState: response.asyncTurn.artifactState,
+            acceptedAt: response.asyncTurn.acceptedAt,
+            deduplicated: Boolean(response.asyncTurn.deduplicated),
+            statusMessage: response.statusMessage,
+            source: response.source,
+            provider: response.provider,
+            model: response.model,
+            repaired: response.repaired,
+            fallbackUsed: response.fallbackUsed,
+            staticCode: 'TURN_ACCEPTED',
+            testsRun: [],
+            filesProduced: [],
+            engine: response.executionEngine ?? null,
+            stages: mergeExecutionStages(sessionPrepareStage ? [sessionPrepareStage] : [], response.executionEngine?.stages ?? []),
+            failureContext: null,
+            attemptSummaries: [],
+          },
+        }));
+        setBusy(false);
+        return;
+      }
+
       const generated = response.package;
       const routeDecision = response.serverRouteDecision ?? clientRouteDecision;
       const latestAttempt = response.attempts.at(-1);
-    const fallbackReason = response.fallbackUsed
-      ? latestAttempt?.outcome === 'timeout'
-        ? `fallback reason: model timeout (${latestAttempt.durationMs || 60000}ms limit)`
-        : latestAttempt?.errorMessage
-          ? `fallback reason: ${latestAttempt.errorMessage}`
-          : 'fallback reason: model request failed'
-      : null;
-    const summary = [
-      response.statusMessage,
-      `source: ${response.source}`,
-        `provider/model: ${response.provider} / ${response.model}`,
-        `repaired: ${String(response.repaired)} | fallback: ${String(response.fallbackUsed)}`,
-        response.requiresReplan ? 'route: replan required' : null,
-        response.executionEngine
-          ? `engine requested/actual/strategy: ${response.executionEngine.requestedEngine} / ${response.executionEngine.actualEngine} / ${response.executionEngine.strategy}`
-          : null,
-        response.executionEngine?.fallbackReason
-          ? `engine fallback: ${response.executionEngine.fallbackReason}`
-          : null,
-        `static: ${response.staticEvaluation.code}`,
-        response.persistenceWarning ? `persistence: ${response.persistenceWarning}` : null,
+      const fallbackReason = response.fallbackUsed
+        ? latestAttempt?.outcome === 'timeout'
+          ? `model timeout (${latestAttempt.durationMs || 60000}ms limit)`
+          : latestAttempt?.errorMessage
+            ? latestAttempt.errorMessage
+            : 'model request failed'
+        : null;
+      const outcome = getExecutionOutcome(response.executionEngine ?? null, true);
+      const recovery = getRecoveryContext(response.executionEngine ?? null);
+      const failureContext = response.executionEngine?.failureContext ?? null;
+      const summary = buildAssistantSummary({
+        outcome,
+        statusMessage: response.statusMessage,
+        source: response.source,
+        provider: response.provider,
+        model: response.model,
+        repaired: response.repaired,
+        fallbackUsed: response.fallbackUsed,
+        requiresReplan: response.requiresReplan,
+        persistenceWarning: response.persistenceWarning,
+        staticCode: response.staticEvaluation.code,
+        engine: response.executionEngine ?? null,
+        failureContext,
+        recovery,
         fallbackReason,
-    ].join('\n');
+      });
 
     const elapsed = Math.max(0, nowMs() - phaseStartedRef.current.generator);
     phaseStartedRef.current.tester = nowMs();
+    phaseStartedRef.current.checker = phaseStartedRef.current.tester;
     setPhases([
       {
         id: 'generator',
@@ -1201,6 +1702,8 @@ export default function CodegenAppShell() {
             endpoint,
             targetId: routeDecision.targetId,
             roleLabel: generatorLabel,
+            outcome,
+            recovery,
             statusMessage: response.statusMessage,
             source: response.source,
             provider: response.provider,
@@ -1212,6 +1715,12 @@ export default function CodegenAppShell() {
               : response.staticEvaluation.code,
             testsRun: ['static-evaluator', 'sandbox-ready', 'sandbox-runTests'],
             filesProduced: ['indexHtml', 'gameJs', 'styleCss', 'manifestJson'],
+            engine: response.executionEngine ?? null,
+            stages: mergeExecutionStages(
+              sessionPrepareStage ? [sessionPrepareStage] : [],
+              response.executionEngine?.stages ?? [],
+            ),
+            failureContext,
             attemptSummaries: toAttemptSummaries(response.attempts),
           },
         };
@@ -1248,7 +1757,8 @@ export default function CodegenAppShell() {
       return;
     }
 
-    const elapsed = Math.max(0, nowMs() - phaseStartedRef.current.tester);
+    const testerElapsed = Math.max(0, nowMs() - phaseStartedRef.current.tester);
+    const checkerElapsed = Math.max(0, nowMs() - phaseStartedRef.current.checker);
     setPhases([
       phases[0] ?? {
         id: 'generator',
@@ -1262,7 +1772,7 @@ export default function CodegenAppShell() {
         label: '测试者',
         state: result.ok ? 'passed' : 'failed',
         detail: result.summary,
-        elapsedMs: elapsed,
+        elapsedMs: testerElapsed,
       },
       {
         id: 'checker',
@@ -1273,7 +1783,7 @@ export default function CodegenAppShell() {
             ? '基础启动通过，但没有项目自定义 runTests。'
             : '符合当前执行模式要求。'
           : '发现错误，建议切换修复或继续调试。',
-        elapsedMs: elapsed,
+        elapsedMs: checkerElapsed,
       },
     ]);
 
@@ -1285,6 +1795,20 @@ export default function CodegenAppShell() {
         ? {
             ...project.lastExecutionTrace,
             sandboxCode: result.code,
+            stages: mergeExecutionStages(project.lastExecutionTrace.stages, [
+              createExecutionStage({
+                key: 'sandbox_test',
+                status: result.ok ? 'completed' : 'failed',
+                durationMs: testerElapsed,
+                detail: result.summary,
+              }),
+              createExecutionStage({
+                key: 'final_check',
+                status: result.ok ? 'completed' : 'failed',
+                durationMs: checkerElapsed,
+                detail: result.ok ? 'Sandbox evaluation completed.' : 'Sandbox evaluation reported failures.',
+              }),
+            ]),
           }
         : project.lastExecutionTrace,
     }));

@@ -11,6 +11,9 @@ const mockAiSessionService = {
   listWorkspaceVersions: vi.fn(),
   getWorkspaceVersionPayload: vi.fn(),
   bootstrapSession: vi.fn(),
+  submitMessageTurn: vi.fn(),
+  getMessageTurnStatus: vi.fn(),
+  getMessageTurnResult: vi.fn(),
   executeMessage: vi.fn(),
   checkpointSession: vi.fn(),
   revokeSession: vi.fn(),
@@ -26,6 +29,9 @@ vi.mock('@/lib/ai-sessions/service', () => ({
   },
   AiSessionMessageNotReadyError: class AiSessionMessageNotReadyError extends Error {
     readonly code = 'message_transport_not_ready';
+  },
+  AiSessionTurnConflictError: class AiSessionTurnConflictError extends Error {
+    readonly code = 'ai_session_turn_conflict';
   },
   AiSessionTransportNotInitializedError: class AiSessionTransportNotInitializedError extends Error {
     readonly code = 'codex_transport_not_initialized';
@@ -71,6 +77,42 @@ describe('ai sessions api routes', () => {
       },
       initTranscript: [],
       turnTranscript: [],
+    });
+    mockAiSessionService.submitMessageTurn.mockResolvedValue({
+      acknowledged: true,
+      deduplicated: false,
+      sessionId: 'sess-1',
+      turnId: 'turn-1',
+      acceptedAt: new Date().toISOString(),
+      threadId: 'thr-1',
+      workspaceVersion: 1,
+      workspaceRoot: '/workspace/home/sessions/sess-1/v1',
+      baseTargetId: null,
+      status: 'running',
+      artifactState: 'pending',
+    });
+    mockAiSessionService.getMessageTurnStatus.mockResolvedValue({
+      turnId: 'turn-1',
+      sessionId: 'sess-1',
+      status: 'running',
+      artifactState: 'pending',
+    });
+    mockAiSessionService.getMessageTurnResult.mockResolvedValue({
+      acknowledged: true,
+      sessionId: 'sess-1',
+      turnId: 'turn-1',
+      acceptedAt: new Date().toISOString(),
+      threadId: 'thr-1',
+      turnStatus: 'completed',
+      agentText: 'done',
+      workspaceVersion: 1,
+      workspaceRoot: '/workspace/home/sessions/sess-1/v1',
+      baseTargetId: null,
+      artifactState: 'durable',
+      finalOutcome: 'completed',
+      recoveryOutcome: 'none',
+      failureCode: null,
+      failureMessage: null,
     });
   });
 
@@ -354,11 +396,48 @@ describe('ai sessions api routes', () => {
     expect(response.status).toBe(409);
   });
 
-  it('returns 502 when session message transport is not wired', async () => {
-    const { AiSessionTransportNotImplementedError } = await import('@/lib/ai-sessions/service');
-    mockAiSessionService.executeMessage.mockRejectedValue(
-      new AiSessionTransportNotImplementedError('Codex app-server message transport is not wired yet'),
+  it('submits an async ai session turn', async () => {
+    const { POST } = await import('@/app/api/ai/sessions/[id]/messages/route');
+    const response = await POST(
+      new Request('http://localhost/api/ai/sessions/sess-1/messages', {
+        method: 'POST',
+        body: JSON.stringify({ mode: 'modify', requestText: 'change color' }),
+      }),
+      { params: Promise.resolve({ id: 'sess-1' }) },
     );
+    const data = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(data.result.turnId).toBe('turn-1');
+    expect(mockAiSessionService.submitMessageTurn).toHaveBeenCalledWith('sess-1', expect.objectContaining({ mode: 'modify' }));
+  });
+
+  it('loads ai session turn status', async () => {
+    const { GET } = await import('@/app/api/ai/sessions/[id]/messages/[turnId]/route');
+    const response = await GET(new Request('http://localhost/api/ai/sessions/sess-1/messages/turn-1'), {
+      params: Promise.resolve({ id: 'sess-1', turnId: 'turn-1' }),
+    });
+    const data = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(data.status.turnId).toBe('turn-1');
+  });
+
+  it('returns 409 when ai session turn result is not ready', async () => {
+    const { AiSessionMessageNotReadyError } = await import('@/lib/ai-sessions/service');
+    mockAiSessionService.getMessageTurnResult.mockRejectedValue(new AiSessionMessageNotReadyError('not ready'));
+
+    const { GET } = await import('@/app/api/ai/sessions/[id]/messages/[turnId]/result/route');
+    const response = await GET(new Request('http://localhost/api/ai/sessions/sess-1/messages/turn-1/result'), {
+      params: Promise.resolve({ id: 'sess-1', turnId: 'turn-1' }),
+    });
+
+    expect(response.status).toBe(409);
+  });
+
+  it('returns 409 when a different active turn already exists', async () => {
+    const { AiSessionTurnConflictError } = await import('@/lib/ai-sessions/service');
+    mockAiSessionService.submitMessageTurn.mockRejectedValue(new AiSessionTurnConflictError('busy'));
 
     const { POST } = await import('@/app/api/ai/sessions/[id]/messages/route');
     const response = await POST(
@@ -369,6 +448,6 @@ describe('ai sessions api routes', () => {
       { params: Promise.resolve({ id: 'sess-1' }) },
     );
 
-    expect(response.status).toBe(502);
+    expect(response.status).toBe(409);
   });
 });

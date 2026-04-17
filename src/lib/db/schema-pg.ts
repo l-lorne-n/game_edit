@@ -186,6 +186,45 @@ export const aiSessionTransportLogs = pgTable('ai_session_transport_logs', {
   createdAt: timestamp('created_at', { withTimezone: true }).notNull(),
 });
 
+export const aiSessionTurns = pgTable('ai_session_turns', {
+  id: text('id').primaryKey(),
+  sessionId: text('session_id')
+    .notNull()
+    .references(() => aiSessions.id, { onDelete: 'cascade' }),
+  projectId: text('project_id').notNull(),
+  workspaceVersion: integer('workspace_version').notNull(),
+  workspaceRoot: text('workspace_root').notNull(),
+  mode: text('mode').notNull(),
+  requestText: text('request_text').notNull(),
+  targetId: text('target_id'),
+  baseTargetId: text('base_target_id'),
+  routeMode: text('route_mode'),
+  routeReason: text('route_reason'),
+  allowedPaths: jsonb('allowed_paths').notNull().default(sql`'[]'::jsonb`),
+  requestFingerprint: text('request_fingerprint').notNull(),
+  status: text('status').notNull().default('submitted'),
+  artifactState: text('artifact_state').notNull().default('pending'),
+  threadId: text('thread_id'),
+  acceptedAt: timestamp('accepted_at', { withTimezone: true }).notNull(),
+  startedAt: timestamp('started_at', { withTimezone: true }),
+  completedAt: timestamp('completed_at', { withTimezone: true }),
+  terminalAt: timestamp('terminal_at', { withTimezone: true }),
+  artifactReadyAt: timestamp('artifact_ready_at', { withTimezone: true }),
+  turnStatus: text('turn_status'),
+  agentText: text('agent_text').notNull().default(''),
+  recoveryOutcome: text('recovery_outcome').notNull().default('none'),
+  finalOutcome: text('final_outcome').notNull().default('pending'),
+  failureCode: text('failure_code'),
+  failureMessage: text('failure_message'),
+  diagnostics: jsonb('diagnostics').notNull().default(sql`'{}'::jsonb`),
+  resultPayload: jsonb('result_payload').notNull().default(sql`'{}'::jsonb`),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true })
+    .notNull()
+    .defaultNow()
+    .$onUpdateFn(() => sql`now()`),
+});
+
 export const hostAuthPendingStates = pgTable('host_auth_pending_states', {
   state: text('state').primaryKey(),
   authRequestId: text('auth_request_id').notNull(),
@@ -255,6 +294,7 @@ export const aiSessionsRelations = relations(aiSessions, ({ many, one }) => ({
   }),
   events: many(aiSessionEvents),
   checkpoints: many(aiSessionCheckpoints),
+  turns: many(aiSessionTurns),
 }));
 
 export const aiSessionEventsRelations = relations(aiSessionEvents, ({ one }) => ({
@@ -267,6 +307,13 @@ export const aiSessionEventsRelations = relations(aiSessionEvents, ({ one }) => 
 export const aiSessionCheckpointsRelations = relations(aiSessionCheckpoints, ({ one }) => ({
   session: one(aiSessions, {
     fields: [aiSessionCheckpoints.sessionId],
+    references: [aiSessions.id],
+  }),
+}));
+
+export const aiSessionTurnsRelations = relations(aiSessionTurns, ({ one }) => ({
+  session: one(aiSessions, {
+    fields: [aiSessionTurns.sessionId],
     references: [aiSessions.id],
   }),
 }));
@@ -284,6 +331,8 @@ export type AiSessionCheckpoint = typeof aiSessionCheckpoints.$inferSelect;
 export type NewAiSessionCheckpoint = typeof aiSessionCheckpoints.$inferInsert;
 export type AiSessionTransportLog = typeof aiSessionTransportLogs.$inferSelect;
 export type NewAiSessionTransportLog = typeof aiSessionTransportLogs.$inferInsert;
+export type AiSessionTurn = typeof aiSessionTurns.$inferSelect;
+export type NewAiSessionTurn = typeof aiSessionTurns.$inferInsert;
 export type HostAuthPendingState = typeof hostAuthPendingStates.$inferSelect;
 export type NewHostAuthPendingState = typeof hostAuthPendingStates.$inferInsert;
 export type HostBrowserAuthAttempt = typeof hostBrowserAuthAttempts.$inferSelect;

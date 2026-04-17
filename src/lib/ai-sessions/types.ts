@@ -72,6 +72,12 @@ export type AiSessionTransportSnapshot = {
 
 export type AiSessionRecoveryOutcome = 'none' | 'same_thread_resumed' | 'same_rollout_thread_restarted';
 
+export type AiSessionTurnState = 'submitted' | 'running' | 'awaiting_artifact' | 'completed' | 'failed' | 'rejected';
+
+export type AiSessionTurnArtifactState = 'pending' | 'durable' | 'missing';
+
+export type AiSessionTurnFinalOutcome = 'pending' | 'completed' | 'failed' | 'deduplicated' | 'rejected';
+
 export type AiSessionRecord = {
   id: string;
   projectId: string;
@@ -108,6 +114,40 @@ export type AiSessionRecord = {
   lastCheckpointVersion: number | null;
   lastCheckpointId: string | null;
   revokedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type AiSessionTurnRecord = {
+  id: string;
+  sessionId: string;
+  projectId: string;
+  workspaceVersion: number;
+  workspaceRoot: string;
+  mode: 'create' | 'modify' | 'debug';
+  requestText: string;
+  targetId: string | null;
+  baseTargetId: string | null;
+  routeMode: 'design' | 'patch' | 'repair' | null;
+  routeReason: string | null;
+  allowedPaths: string[];
+  requestFingerprint: string;
+  status: AiSessionTurnState;
+  artifactState: AiSessionTurnArtifactState;
+  threadId: string | null;
+  acceptedAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+  terminalAt: string | null;
+  artifactReadyAt: string | null;
+  turnStatus: string | null;
+  agentText: string;
+  recoveryOutcome: AiSessionRecoveryOutcome;
+  finalOutcome: AiSessionTurnFinalOutcome;
+  failureCode: string | null;
+  failureMessage: string | null;
+  diagnostics: Record<string, unknown>;
+  resultPayload: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
 };
@@ -210,6 +250,29 @@ export type CreateAiSessionCheckpointInput = {
   manifest?: Record<string, unknown>;
 };
 
+export type CreateAiSessionTurnInput = Omit<AiSessionTurnRecord, 'createdAt' | 'updatedAt'>;
+
+export type UpdateAiSessionTurnInput = Partial<
+  Pick<
+    AiSessionTurnRecord,
+    | 'status'
+    | 'artifactState'
+    | 'threadId'
+    | 'startedAt'
+    | 'completedAt'
+    | 'terminalAt'
+    | 'artifactReadyAt'
+    | 'turnStatus'
+    | 'agentText'
+    | 'recoveryOutcome'
+    | 'finalOutcome'
+    | 'failureCode'
+    | 'failureMessage'
+    | 'diagnostics'
+    | 'resultPayload'
+  >
+>;
+
 export type AiSessionRepository = {
   createSession(input: AiSessionRecord): Promise<AiSessionRecord>;
   listProjectSessions(projectId: string): Promise<AiSessionRecord[]>;
@@ -221,4 +284,10 @@ export type AiSessionRepository = {
   listTransportLogs(sessionId: string): Promise<AiSessionTransportLogEntry[]>;
   findCheckpointByIdempotencyKey(sessionId: string, idempotencyKey: string): Promise<AiSessionCheckpointRecord | null>;
   createCheckpoint(input: CreateAiSessionCheckpointInput): Promise<AiSessionCheckpointRecord>;
+  createTurn(input: CreateAiSessionTurnInput): Promise<AiSessionTurnRecord>;
+  getTurn(turnId: string): Promise<AiSessionTurnRecord | null>;
+  listSessionTurns(sessionId: string): Promise<AiSessionTurnRecord[]>;
+  findActiveTurn(sessionId: string): Promise<AiSessionTurnRecord | null>;
+  findTurnByRequestFingerprint(sessionId: string, requestFingerprint: string): Promise<AiSessionTurnRecord | null>;
+  updateTurn(turnId: string, input: UpdateAiSessionTurnInput): Promise<AiSessionTurnRecord>;
 };

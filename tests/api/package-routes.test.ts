@@ -5,11 +5,32 @@ const mockProjectService = {
   getProject: vi.fn(),
 };
 
+const mockAiSessionService = {
+  submitMessageTurn: vi.fn(),
+};
+
 const runCodexPackageTaskMock = vi.fn();
 const computePackageRouteDecisionMock = vi.fn();
 
 vi.mock('@/lib/projects/service', () => ({
   createProjectService: () => mockProjectService,
+}));
+
+vi.mock('@/lib/ai-sessions/service', () => ({
+  AiSessionMessageNotReadyError: class AiSessionMessageNotReadyError extends Error {
+    readonly code = 'message_transport_not_ready';
+  },
+  AiSessionTransportNotImplementedError: class AiSessionTransportNotImplementedError extends Error {
+    readonly reason: string;
+    constructor(message: string, reason = 'transport_not_implemented') {
+      super(message);
+      this.reason = reason;
+    }
+  },
+  AiSessionTransportNotInitializedError: class AiSessionTransportNotInitializedError extends Error {
+    readonly code = 'codex_transport_not_initialized';
+  },
+  createAiSessionService: () => mockAiSessionService,
 }));
 
 vi.mock('@/lib/ai/codex-package-task', () => ({
@@ -38,6 +59,19 @@ describe('package api routes', () => {
       targetId: '__current__',
       requestText: 'change color',
     });
+    mockAiSessionService.submitMessageTurn.mockResolvedValue({
+      acknowledged: true,
+      deduplicated: false,
+      sessionId: 'sess-1',
+      turnId: 'turn-1',
+      acceptedAt: new Date().toISOString(),
+      threadId: 'thr-1',
+      workspaceVersion: 1,
+      workspaceRoot: '/workspace/home/sessions/sess-1/v1',
+      baseTargetId: null,
+      status: 'running',
+      artifactState: 'pending',
+    });
   });
 
   it('does not reject ai-session modify just because routing says design', async () => {
@@ -56,35 +90,6 @@ describe('package api routes', () => {
       targetId: '__current__',
       requestText: 'add a whole new combat system',
     });
-    runCodexPackageTaskMock.mockResolvedValue({
-      solveResult: {
-        pkg: {
-          indexHtml: '<html></html>',
-          gameJs: 'console.log(2);',
-          styleCss: 'body { background: white; }',
-          manifestJson: '{"title":"Demo","summary":"Demo","capabilities":[]}',
-        },
-        manifest: { title: 'Demo', summary: 'Demo', capabilities: [] },
-        staticEvaluation: { ok: true, code: 'STATIC_OK', source: 'static', summary: 'ok', at: new Date().toISOString(), errors: [], logs: [] },
-        repaired: false,
-        fallbackUsed: false,
-        source: 'model',
-        statusMessage: 'done',
-        provider: 'test',
-        model: 'test-model',
-        attempts: [],
-      },
-      requiresReplan: false,
-      executionTraceMeta: {
-        requestedEngine: 'codex-app-server',
-        actualEngine: 'codex-app-server',
-        strategy: 'plan_then_execute',
-        routeReason: 'MODIFY_REQUEST',
-        allowedPaths: ['indexHtml', 'gameJs', 'styleCss', 'manifestJson'],
-        fallbackReason: null,
-      },
-    });
-
     const { POST } = await import('@/app/api/package/modify/route');
     const response = await POST(
       new Request('http://localhost/api/package/modify', {
@@ -105,41 +110,15 @@ describe('package api routes', () => {
     );
     const data = await response.json();
 
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(202);
     expect(data.ok).toBe(true);
-    expect(runCodexPackageTaskMock).toHaveBeenCalled();
+    expect(data.accepted).toBe(true);
+    expect(mockAiSessionService.submitMessageTurn).toHaveBeenCalled();
+    expect(runCodexPackageTaskMock).not.toHaveBeenCalled();
     expect(mockProjectService.saveGeneratedPackage).not.toHaveBeenCalled();
   });
 
   it('does not persist durable project versions directly for ai-session generate', async () => {
-    runCodexPackageTaskMock.mockResolvedValue({
-      solveResult: {
-        pkg: {
-          indexHtml: '<html></html>',
-          gameJs: 'console.log(1);',
-          styleCss: 'body {}',
-          manifestJson: '{"title":"Demo","summary":"Demo","capabilities":[]}',
-        },
-        manifest: { title: 'Demo', summary: 'Demo', capabilities: [] },
-        staticEvaluation: { ok: true, code: 'STATIC_OK', source: 'static', summary: 'ok', at: new Date().toISOString(), errors: [], logs: [] },
-        repaired: false,
-        fallbackUsed: false,
-        source: 'model',
-        statusMessage: 'done',
-        provider: 'test',
-        model: 'test-model',
-        attempts: [],
-      },
-      executionTraceMeta: {
-        requestedEngine: 'codex-app-server',
-        actualEngine: 'codex-app-server',
-        strategy: 'plan_then_execute',
-        routeReason: 'CREATE_REQUEST',
-        allowedPaths: ['indexHtml', 'gameJs', 'styleCss', 'manifestJson'],
-        fallbackReason: null,
-      },
-    });
-
     const { POST } = await import('@/app/api/package/generate/route');
     const response = await POST(
       new Request('http://localhost/api/package/generate', {
@@ -149,9 +128,11 @@ describe('package api routes', () => {
     );
     const data = await response.json();
 
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(202);
     expect(data.ok).toBe(true);
+    expect(data.accepted).toBe(true);
     expect(data.project).toBeNull();
+    expect(mockAiSessionService.submitMessageTurn).toHaveBeenCalled();
     expect(mockProjectService.saveGeneratedPackage).not.toHaveBeenCalled();
   });
 });

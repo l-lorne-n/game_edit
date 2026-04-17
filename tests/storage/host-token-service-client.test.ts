@@ -28,7 +28,7 @@ describe('host token service client', () => {
     );
 
     const client = new HostTokenServiceClient('http://localhost:8787', 'secret-key', fetchImpl as typeof fetch);
-    const result = await client.bootstrap({ sessionId: 'sess-1' });
+    const result = await client.bootstrap({ sessionId: 'sess-1', bindToken: 'bind-1' });
 
     expect(result.accessToken).toBe('access-token');
     expect(fetchImpl).toHaveBeenCalledWith(

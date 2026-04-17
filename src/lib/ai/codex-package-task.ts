@@ -1,8 +1,14 @@
+import type { PackageExecutionTraceMeta, RecoveryContext, ExecutionOutcome } from '@/lib/ai/execution-trace';
 import type { GeneratedGamePackage } from '@/lib/package/contracts';
 import type { PackageSolveResult } from '@/lib/ai/generate-package';
 import { runAppServerPackageExecutor } from '@/lib/ai/executors/app-server-package-executor';
 import { runLegacyPackageExecutor } from '@/lib/ai/executors/legacy-package-executor';
-import type { CodexExecutionEngine, CodexExecutionStrategy, PackageExecutorResult } from '@/lib/ai/executors/types';
+import {
+  PackageExecutorFailure,
+  type CodexExecutionEngine,
+  type CodexExecutionStrategy,
+  type PackageExecutorResult,
+} from '@/lib/ai/executors/types';
 import { getCodexRouteEngine } from '@/lib/config/infra';
 
 export type CodexPackageTaskMode = 'create' | 'modify' | 'debug';
@@ -39,16 +45,60 @@ export type RunCodexPackageTaskResult = {
   envelope: CodexTaskEnvelope;
   requiresReplan: boolean;
   solveResult: PackageSolveResult;
-  executionTraceMeta: {
-    requestedEngine: CodexExecutionEngine;
-    actualEngine: CodexExecutionEngine;
-    strategy: CodexExecutionStrategy;
-    routeReason: string | null;
-    allowedPaths: string[];
-    fallbackReason: string | null;
-  };
+  executionTraceMeta: PackageExecutionTraceMeta;
   requiresReinit: boolean;
 };
+
+export class CodexPackageTaskError extends Error {
+  readonly code: string | null;
+  readonly statusHint: 409 | 500 | 502;
+  readonly requiresReinit: boolean;
+  readonly executionTraceMeta: PackageExecutionTraceMeta;
+
+  constructor(input: {
+    message: string;
+    code?: string | null;
+    statusHint: 409 | 500 | 502;
+    requiresReinit: boolean;
+    executionTraceMeta: PackageExecutionTraceMeta;
+  }) {
+    super(input.message);
+    this.code = input.code ?? null;
+    this.statusHint = input.statusHint;
+    this.requiresReinit = input.requiresReinit;
+    this.executionTraceMeta = input.executionTraceMeta;
+  }
+}
+
+function buildExecutionTraceMeta(envelope: CodexTaskEnvelope, input: {
+  outcome: ExecutionOutcome;
+  recovery: RecoveryContext | null;
+  stages: PackageExecutionTraceMeta['stages'];
+  failureContext: PackageExecutionTraceMeta['failureContext'];
+}): PackageExecutionTraceMeta {
+  return {
+    requestedEngine: envelope.requestedEngine,
+    actualEngine: envelope.actualEngine,
+    strategy: envelope.strategy,
+    routeReason: envelope.routeReason,
+    allowedPaths: envelope.allowedPaths,
+    fallbackReason: envelope.fallbackReason,
+    outcome: input.outcome,
+    recovery: input.recovery,
+    stages: input.stages,
+    failureContext: input.failureContext,
+  };
+}
+
+function inferStatusHint(error: PackageExecutorFailure): 409 | 500 | 502 {
+  if (error.code === 'codex_transport_not_initialized' || error.code === 'message_transport_not_ready') {
+    return 409;
+  }
+  if (error.code && error.code.startsWith('codex_')) {
+    return 502;
+  }
+  return 500;
+}
 
 function getExecutionEngine(): CodexExecutionEngine {
   return getCodexRouteEngine();
@@ -89,7 +139,28 @@ export async function runCodexPackageTask(input: RunCodexPackageTaskInput): Prom
     fallbackReason: null,
   };
 
-  const execution = await executeTask(envelope.requestedEngine, input);
+  let execution: PackageExecutorResult;
+  try {
+    execution = await executeTask(envelope.requestedEngine, input);
+  } catch (error) {
+    if (error instanceof PackageExecutorFailure) {
+      envelope.actualEngine = error.actualEngine;
+      envelope.fallbackReason = error.fallbackReason;
+      throw new CodexPackageTaskError({
+        message: error.message,
+        code: error.code ?? error.failureContext?.code ?? null,
+        statusHint: inferStatusHint(error),
+        requiresReinit: error.requiresReinit,
+        executionTraceMeta: buildExecutionTraceMeta(envelope, {
+          outcome: 'hard_failure',
+          recovery: null,
+          stages: error.executionStages,
+          failureContext: error.failureContext,
+        }),
+      });
+    }
+    throw error;
+  }
   const solveResult: PackageSolveResult = execution.solveResult;
   envelope.actualEngine = execution.actualEngine;
   envelope.fallbackReason = execution.fallbackReason;
@@ -98,14 +169,12 @@ export async function runCodexPackageTask(input: RunCodexPackageTaskInput): Prom
     envelope,
     requiresReplan: false,
     solveResult,
-    executionTraceMeta: {
-      requestedEngine: envelope.requestedEngine,
-      actualEngine: envelope.actualEngine,
-      strategy,
-      routeReason: envelope.routeReason,
-      allowedPaths: envelope.allowedPaths,
-      fallbackReason: envelope.fallbackReason,
-    },
+    executionTraceMeta: buildExecutionTraceMeta(envelope, {
+      outcome: execution.outcome,
+      recovery: execution.recovery,
+      stages: execution.executionStages,
+      failureContext: execution.failureContext,
+    }),
     requiresReinit: execution.requiresReinit,
   };
 }
