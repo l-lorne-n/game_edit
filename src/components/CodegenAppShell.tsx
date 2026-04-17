@@ -1348,8 +1348,15 @@ export default function CodegenAppShell() {
           : null,
       };
       } else if (mode === 'modify') {
-        const targetId = effectiveModifyBaseId;
-        const targetPackage = resolvePackageFromTarget(activeProject, targetId);
+        let targetId: string;
+        let targetPackage: GeneratedGamePackage | null;
+        if (viewedAiSessionVersionId && viewedAiSessionVersion) {
+          targetId = viewedAiSessionVersionId;
+          targetPackage = viewedAiSessionVersion.package;
+        } else {
+          targetId = effectiveModifyBaseId;
+          targetPackage = resolvePackageFromTarget(activeProject, targetId);
+        }
         if (!targetPackage) {
           window.alert('No modify baseline selected.');
           return;
@@ -1534,6 +1541,11 @@ export default function CodegenAppShell() {
     }
 
       if (response.accepted) {
+        if (viewedAiSessionVersionId) {
+          setViewedAiSessionVersionId('');
+          setViewedAiSessionVersion(null);
+          setRuntimeNonce(prev => prev + 1);
+        }
         const routeDecision = response.serverRouteDecision ?? clientRouteDecision;
         const outcome: ExecutionOutcome = 'pending';
         const summary = buildAssistantSummary({
@@ -2015,7 +2027,7 @@ export default function CodegenAppShell() {
                   busy ||
                   !composerText.trim() ||
                   (mode === 'debug' && requireDebugTargetChoice) ||
-                  Boolean(viewedAiSessionVersionId)
+                  (mode !== 'modify' && Boolean(viewedAiSessionVersionId))
                 }
                 onClick={() => {
                   handleSubmit().catch(error => {
@@ -2039,7 +2051,17 @@ export default function CodegenAppShell() {
               <span className={styles.mono}>{busy ? 'Working...' : 'Idle'}</span>
             </div>
             {!codexReady ? <span className={styles.mono}>Send will auto-initialize Codex if OAuth is ready.</span> : null}
-            {viewedAiSessionVersionId ? <span className={styles.mono} style={{ color: 'var(--text-dim)' }}>Cannot send requests while viewing a read-only Box version. Switch to Active Head first.</span> : null}
+            {viewedAiSessionVersionId ? (
+              mode === 'modify' ? (
+                <span className={styles.mono} style={{ color: 'var(--text-dim)' }}>
+                  将基于 {viewedAiSessionVersionId} 复制生成新版本。
+                </span>
+              ) : (
+                <span className={styles.mono} style={{ color: 'var(--text-dim)' }}>
+                  Cannot send requests while viewing a read-only Box version. Switch to Active Head first.
+                </span>
+              )
+            ) : null}
           </div>
 
           {isServerBackedProject(activeProject) ? (
