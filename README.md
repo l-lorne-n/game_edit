@@ -1,779 +1,1000 @@
-# AI Mini-Game Workspace
+# game_edit
 
-这是一个以面试作业为目标、分两阶段演进的 AI 原生 2D 游戏编辑器项目。
+一个面向交接与继续开发的**当前状态 README**。
 
-- 第一版（v1）是“受约束 DSL + 可玩预览”的 AI 游戏原型编辑器。
-- 第二版（v2）是在第一版经验基础上，演进出的“多项目 + 代码生成 + 沙箱运行 + 调试/修复 + Workbench 可解释性”工作区。
+这份文档的目标不是复述最早的产品设想，而是准确说明：
 
-当前仓库默认分支面向第二版使用场景，但第一版相关代码仍然保留在仓库中，方便展示演进过程与设计取舍。
+1. 这个项目**现在真实跑的是什么架构**。
+2. 数据分别落在哪一层（Neon / Blob / Box / 浏览器缓存）。
+3. create / modify / debug / checkpoint / archive 这些动作到底各自意味着什么。
+4. Upstash Box + Codex runtime 是如何被接起来、认证、通信、回传结果的。
+5. 哪些历史说法已经不再适合作为“当前实现”的解释。
 
-## 项目目标
+如果你是第一次接手这个项目，建议按下面顺序阅读：
 
-这个项目不是通用游戏引擎，也不是为了追求复杂美术效果。
-
-它想解决的是一个更具体的问题：
-
-- 用户输入自然语言
-- AI 尝试生成一个可运行的小游戏原型
-- 系统尽量对生成结果做校验、修复、归档与解释
-- 用户可以继续修改、调试、回退、分支化迭代
-
-换句话说，这个项目关注的重点是：
-
-- 自然语言到游戏原型的闭环
-- 生成结果的可运行性
-- 失败时的兜底与修复
-- 版本管理与可解释性
+1. **当前系统一页概览**
+2. **核心对象模型**
+3. **Upstash Box + Codex Runtime：启动、认证、通信与回传链路**
+4. **存储分层与职责**
+5. **版本语义**
+6. **端到端工作流**
+7. **最容易踩坑的点**
 
 ---
 
-## 第二版（当前主版本）：多项目代码生成工作区
+## 1. 当前系统一页概览
 
-第二版的核心思想是：
+`game_edit` 现在不是一个单纯“让 AI 生成小游戏代码”的页面，而是一个：
 
-- 不再只生成受约束的 dodge DSL
-- 而是生成一个固定结构的小游戏代码包
-- 把小游戏放进浏览器沙箱里运行
-- 通过测试者与检查者流程决定是否可用
-- 用项目与快照管理整个生成/修改/修复过程
+> **带 AI session、版本化 Box 工作区、Codex app-server、可预览、可测试、可 checkpoint/归档的小游戏编辑工作台。**
 
-### 第二版整体架构
+当前系统可以粗分成 4 层：
 
-第二版的主入口在：
+1. **前端工作区层**
+   - 项目列表
+   - 聊天与模式切换（create / modify / debug）
+   - Workbench / 执行状态 / 预览
+
+2. **项目与正式版本层**
+   - `projects`
+   - `project_versions`
+   - Vercel Blob 中的 canonical 文件
+
+3. **AI session 与 Box 工作区层**
+   - `ai_sessions`
+   - `ai_session_turns`
+   - `ai_session_events`
+   - `ai_session_checkpoints`
+   - Upstash Box 中的 `sessions/{sessionId}/vN`
+
+4. **Codex 运行与回传层**
+   - host token service
+   - Box 中的 Codex runtime
+   - Box 中的 local daemon
+   - `submit / status / result` async turn 协议
+
+当前系统的主设计原则是：
+
+- **正式项目历史** 与 **AI session 工作头** 是两条不同的状态链。
+- **浏览器展示层 transcript** 与 **服务端执行层记录** 也不是同一份数据。
+- Upstash Box 承担的是**可变运行时工作区**，不是最终归档层。
+
+---
+
+## 2. 当前真实技术栈
+
+从 `package.json` 和当前代码可确认，当前主栈是：
+
+- **Next.js**
+- **React**
+- **Neon / PostgreSQL**
+- **Drizzle ORM**
+- **Vercel Blob**
+- **Upstash Box**
+- **Vitest / ESLint**
+
+相关入口：
 
 - `src/app/page.tsx`
 - `src/components/CodegenAppShell.tsx`
+- `src/lib/db/index.ts`
+- `src/lib/db/schema-pg.ts`
+- `src/lib/storage/*`
+- `src/lib/sandbox/providers/upstash-box.ts`
+- `src/lib/ai-sessions/*`
 
-它把系统拆成 4 个关键层：
+---
 
-1. UI 工作区层
-2. 项目/快照状态层
-3. AI 代码生成与修复层
-4. 沙箱运行与测试层
+## 3. 核心对象模型
 
-### 第二版的 Agent 系统与分工
+理解这个项目，必须先把下面几个对象分清楚。
 
-第二版在产品表现上采用了“架构师 / 工人 / 修理工 / 测试者 / 检查者”的角色设计，但底层不是五个完全独立的自治体，而是一个更务实的组合：
+### 3.1 Project
 
-- 生成角色（Architect / Worker / Fixer）
-- 确定性测试角色（Tester）
-- 审查与路由角色（Checker）
+Project 是最上层的“正式项目”对象，对应：
 
-这样设计的原因是：
+- `projects`
+- 前端左侧项目列表中的一项
 
-- 让用户能理解当前系统“正在做什么”
-- 又避免做成一个复杂但不可靠的多 agent 传话系统
+它有：
 
-#### 1. 架构师（Architect）
+- `id`
+- `name`
+- `currentVersion`
+- 多个正式归档版本
 
-职责：
+Project 的 `id` 也是 Blob 路径里：
 
-- 在新建游戏时负责生成完整的小游戏包
-- 在用户修改已经明显超出原有 editable 范围时，负责做设计级重构
-- 输出新的包结构、玩法规则、manifest 描述与可编辑范围
+```text
+projects/{projectId}/vN/index.html
+```
 
-为什么需要它：
+中的 `{projectId}`。
 
-- 有些修改不是“补丁式修改”，而是在改玩法规则本身
-- 例如碰撞逻辑、穿墙规则、核心机制变化，不适合交给只做局部 patch 的角色
+### 3.2 Project Version
 
-能力边界：
+Project Version 是**正式归档版本**，对应：
 
-- 允许触及 `indexHtml`、`gameJs`、`styleCss`、`manifestJson` 四个文件
-- 允许改变玩法逻辑与结构
-- 适用于 `design` 路由
+- `project_versions.version`
+- Blob 中的 `v1 / v2 / v3 ...`
 
-对应代码：
+它是连续增长的：
 
-- `src/lib/workspace/routing.ts`
-- `src/components/CodegenAppShell.tsx`
+- `currentVersion + 1`
 
-#### 2. 工人（Worker）
+不会跳号。
 
-职责：
+### 3.3 AI Session
 
-- 处理落在当前 editable scope 内的修改请求
-- 例如已有玩法上的小幅改动、数值调整、界面文案、局部逻辑 patch
+AI Session 是用户和 Codex 工作区之间的持续会话身份，对应：
 
-为什么需要它：
+- `ai_sessions`
 
-- 不是每次修改都要走“重构”
-- 当用户只是改小范围内容时，直接 patch 更快、更便宜，也更符合编辑器语义
+它维护：
 
-能力边界：
+- `projectId`
+- `baseVersion`
+- `activeWorkspaceVersion`
+- `latestWorkspaceVersion`
+- `boxId`
+- `codexHomeKey`
+- `authState`
+- `appServerStatus`
+- `daemonStatus`
+- continuity / lease / checkpoint 状态
 
-- 主要面向 `patch` 路由
-- 默认只应该做局部修改，不负责大规模重构
-- editable scope 主要来自当前包的 `manifest.editable`
+### 3.4 Workspace Version
 
-对应代码：
+Workspace Version 是 **Box 工作区版本**，不是正式 project version。
 
-- `src/lib/workspace/routing.ts`
-- `src/components/CodegenAppShell.tsx`
+它对应：
 
-#### 3. 修理工（Fixer）
+- `activeWorkspaceVersion`
+- `latestWorkspaceVersion`
+- Box 内目录：
 
-职责：
+```text
+sessions/{sessionId}/v1
+sessions/{sessionId}/v2
+sessions/{sessionId}/v3
+```
 
-- 接收用户给出的错误描述
-- 结合当前目标版本、最近 evaluator 结果与运行状态，尝试做修复
+前端把它显示成：
 
-为什么需要它：
+- `session:v1`
+- `session:v2`
 
-- “改功能”和“修错误”是两条不同的产品路径
-- 修错误时，用户通常希望系统围绕某个明确目标版本和报错上下文来修，而不是重新设计玩法
+### 3.5 Turn
 
-能力边界：
+Turn 是一次 create / modify / debug 请求的执行记录，对应：
 
-- 对应 `debug` 模式
-- 可以修改四文件包，但其目标是“修复可运行性或行为问题”，不是重新定义产品方向
+- `ai_session_turns`
 
-对应代码：
+它保存：
 
-- `src/components/CodegenAppShell.tsx`
-- `src/app/api/package/debug/route.ts`
-- `src/lib/ai/generate-package.ts`
+- `requestText`
+- `workspaceVersion`
+- `status`
+- `artifactState`
+- `agentText`
+- `resultPayload`
+- `diagnostics`
+- `failureCode` / `failureMessage`
 
-#### 4. 测试者（Tester）
+### 3.6 Checkpoint
 
-职责：
+Checkpoint 是把 **AI session 当前工作头** 正式提交成新的 project version 的动作，对应：
 
-- 不是 LLM agent，而是确定性的运行验证工具
-- 在沙箱中检查小游戏是否启动、是否报错、是否返回测试结果
+- `ai_session_checkpoints`
 
-为什么这样设计：
+它和 Archive 不是一个概念，后文会专门讲。
 
-- 如果“测试者”也是一个会瞎猜的模型，那整个系统会失去可信度
-- 这里必须尽量靠可重复的确定性行为
+---
 
-能力边界：
+## 4. 存储分层与职责
 
-- 只负责运行与记录，不做主观评估
-- 当前可做的验证包括：
-  - iframe sandbox 启动
-  - READY 握手
-  - `runTests()` 钩子（如果项目实现了）
-  - 运行时报错捕获
-  - 超时检测
+这是交接时最容易被说错的一部分。
 
-对应代码：
+### 4.1 Neon：结构化数据库
 
-- `src/components/SandboxPreview.tsx`
-- `src/lib/evaluator/static.ts`
-- `src/lib/evaluator/types.ts`
+Neon 负责存：
 
-#### 5. 检查者（Checker）
+- `projects`
+- `project_versions`
+- `ai_sessions`
+- `ai_session_turns`
+- `ai_session_events`
+- `ai_session_checkpoints`
+- `ai_session_transport_logs`
+- host auth 相关表
 
-职责：
+也就是说，Neon 存的是：
 
-- 给修改请求做路由判断
-- 判断这次请求更像是 worker patch 还是 architect redesign
-- 汇总 tester 结果与执行信息，形成可解释输出
+- 项目元数据
+- 版本元数据
+- AI session 生命周期
+- turn 记录
+- event / checkpoint / transport log
+- OAuth / binding / host auth session 元数据
 
-为什么需要它：
+Neon **不是**文件存储。
 
-- 如果只显示“成功/失败”，用户不知道系统到底为什么这么决定
-- 检查者是系统的解释层和边界判断层
+### 4.2 Vercel Blob：正式项目文件的对象存储
 
-能力边界：
+Blob 负责存**正式项目版本**对应的 4 个 canonical 文件：
 
-- 它可以建议与解释
-- 它负责给出 `routeDecision`
-- 但它不是独立执行者，真正执行仍由生成/修复角色完成
+- `index.html`
+- `game.js`
+- `style.css`
+- `manifest.json`
 
-对应代码：
+路径规则固定为：
 
-- `src/lib/workspace/routing.ts`
-- `src/components/RequestWorkbench.tsx`
-- `src/components/CodegenAppShell.tsx`
-
-### 第二版如何确定 agent 分工
-
-当前第二版的路由决策核心在：
-
-- `src/lib/workspace/routing.ts`
-
-它主要根据三件事判断：
-
-1. 当前模式
-   - `create`
-   - `modify`
-   - `debug`
-2. 当前目标版本的 `manifest.editable`
-3. 用户请求中是否包含明显的“规则/机制级改动”信号
-
-例如：
-
-- `create` -> 默认走架构师
-- `debug` -> 默认走修理工
-- `modify` -> 先看是否命中 editable scope；如果像是碰撞规则、墙体规则、机制变化，则更倾向架构师
-
-### 第二版的代码产物结构
-
-第二版不再让 AI 输出旧版 DSL，而是输出一个固定的 4 文件包：
-
-- `indexHtml`
-- `gameJs`
-- `styleCss`
-- `manifestJson`
-
-相关定义在：
-
-- `src/lib/package/contracts.ts`
-- `src/lib/package/template.ts`
-
-这样做的原因是：
-
-- 仍然允许“任意小游戏代码生成”
-- 但把输出限制在可控范围内，便于：
-  - 归档
-  - diff
-  - fallback
-  - 修理
-  - 沙箱测试
-
-### 第二版的项目与归档管理
-
-第二版引入了“工作区 -> 项目 -> 快照”的层级：
-
-- 一个工作区里可以有多个项目
-- 一个项目代表一个小游戏
-- 一个项目下面可以有多个快照（归档版本）
-
-相关核心代码：
-
-- `src/lib/workspace/types.ts`
-- `src/lib/workspace/state.ts`
-- `src/lib/workspace/storage.ts`
-
-#### 项目管理
-
-支持：
-
-- 新建项目
-- 删除项目
-- 切换项目
-- 项目级聊天记录保留
-
-删除项目时：
-
-- 会连带删除该项目下全部快照
-- 这是有意设计的，因为项目是最上层容器
-
-#### 快照（归档）管理
-
-支持：
-
-- 自动归档新结果
-- 手动归档当前结果
-- Restore 恢复历史版本
-- 选择某个快照作为修改基线
-- 选择某个快照作为 Debug 目标
-- 父子快照关系展示
-- 删除父级快照时递归删除子分支
-
-快照分支关系与去重/层级展示逻辑主要在：
-
-- `src/lib/workspace/state.ts`
-
-#### 本地持久化设计
-
-第二版的数据默认保存在浏览器本地，而不是云端。
-
-优先使用：
-
-- IndexedDB
-
-兜底使用：
-
-- localStorage
-
-相关实现：
-
-- `src/lib/workspace/storage.ts`
-
-并且还支持把第一版遗留的 archive 数据迁移成：
-
-- `Imported Legacy Project`
-
-### 第二版 UI 结构
-
-第二版主界面由四块区域组成：
-
-#### 1. 左侧项目栏
-
-作用：
-
-- 显示项目列表
-- 新建项目
-- 切换当前项目
-- 删除当前项目
-
-对应代码：
-
-- `src/components/CodegenAppShell.tsx`
-
-#### 2. 中左聊天区
-
-作用：
-
-- 展示当前项目的完整消息记录
-- 提供三种显式模式切换：
-  - 创建游戏
-  - 改游戏
-  - 修错误
-- 在 `modify` 模式下选择修改基线快照
-- 在 `debug` 模式下选择修复目标版本
-
-设计原因：
-
-- 不再让系统暗中猜“你是在修改还是在报错”
-- 把用户意图显式表达成模式
-
-#### 3. 中间状态栏
-
-作用：
-
-- 展示当前请求的 agent 执行状态
-- 用 `generator / tester / checker` 三段状态展示本次运行过程
-- 显示状态 badge、说明文字与耗时
-
-这是“产品化的 agent 视觉层”，帮助用户理解当前系统在忙什么。
-
-#### 4. 右侧预览与快照区
-
-作用：
-
-- 显示当前项目的游戏预览
-- 管理快照
-- Restore / Archive / Delete Snapshot
-- 选择当前查看的快照
-
-### 第二版 Workbench 设计
-
-第二版重新引入了 Workbench，并把它变成解释层。
-
-对应代码：
-
-- `src/components/RequestWorkbench.tsx`
-
-Workbench 目前有 4 个大框：
-
-#### 1. Routing Summary
-
-里面展示：
-
-- 这次请求被路由到哪个 agent
-- routeMode 是 `design / patch / repair` 哪一种
-- confidence
-- primary / secondary reason codes
-- inferred editable scope
-- allowedPaths
-- allowedChangeTypes
-- 这次为什么这么路由
-
-这个框解决的问题是：
-
-- “为什么这次是工人，不是架构师？”
-
-#### 2. Execution Trace
-
-里面展示：
-
-- requestMode
-- endpoint
-- targetId
-- roleLabel
-- statusMessage
-- source（model / repair / template 等）
-- provider / model
-- repaired / fallbackUsed
-- staticCode / sandboxCode
-- testsRun
-- filesProduced
-
-这个框解决的问题是：
-
-- “这次到底真正跑了什么？”
-
-#### 3. Evaluator
-
-里面展示：
-
-- 当前 evaluator 结果
-- READY / TIMEOUT / TEST_FAILED 等状态
-- bootMs
-- errors / logs
-
-这个框用来解释：
-
-- 系统为什么认为它能跑/不能跑
-
-#### 4. Attempts
-
-里面展示：
-
-- attemptsCount
-- 每次模型尝试的：
-  - provider
-  - model
-  - mode
-  - outcome
-  - durationMs
-  - errorMessage
-
-这个框用来解释：
-
-- 为什么会 fallback
-- 是 parse 失败、schema 失败、error 还是 timeout
-
-### 第二版的运行与验证链路
-
-第二版的 API 主要是：
-
-- `src/app/api/package/generate/route.ts`
-- `src/app/api/package/modify/route.ts`
-- `src/app/api/package/debug/route.ts`
-
-背后的主逻辑在：
-
-- `src/lib/ai/generate-package.ts`
-
-主链路大致是：
-
-1. 根据模式生成 prompt
-2. 调用模型
-3. 从返回文本中提取 JSON/YAML 候选
-4. 解析为 4 文件包
-5. 做静态校验
-6. 不通过则做一次 repair
-7. 再不通过则 fallback 到模板包
-
-### 第二版的沙箱与测试
-
-当前第二版不是把生成代码直接跑在宿主页面，而是用 iframe sandbox 运行。
+```text
+projects/{projectId}/v{version}/{file}
+```
 
 相关代码：
 
-- `src/components/SandboxPreview.tsx`
+- `src/lib/storage/index.ts`
+- `src/lib/projects/service.ts`
 
-主要做了这些事：
+Blob **不是数据库**。
 
-- 通过 `srcdoc` 注入小游戏包
-- 用 `postMessage` 做 host/guest 通信
-- 监听 READY
-- 触发 `RUN_TESTS`
-- 捕获：
-  - runtime error
-  - unhandled rejection
-  - console.error
-  - READY timeout
+### 4.3 Upstash Box：AI session 的可变工作区
 
-这样做的意义是：
+Box 负责存：
 
-- 让 AI 生成的小游戏尽量隔离运行
-- 不直接污染主应用页面
-- 同时又能把运行结果传回 Workbench
+- `sessions/{sessionId}/vN` 工作区文件
+- `.codex-daemon.mjs`
+- `.codex-daemon-config.json`
+- `.codex-turns/{turnId}.json`
+- `.codex-turns/{turnId}.messages.jsonl`
+- 安装好的 Codex runtime 二进制
 
-### 第二版的局限
+它是：
 
-第二版虽然比第一版自由很多，但它仍然有明确边界：
+> **运行时、可变、面向 session 的工作区**
 
-- 仍然不是通用游戏引擎
-- 仍然没有真正的云端项目同步
-- 生成结果可能 fallback
-- `runTests` 并不是所有生成项目都稳定实现
-- OpenRouter 路径虽然预留了，但主验证路径仍然是 apiyi
-- 当前的路由决策仍然是启发式，不是完美规划器
+不是正式归档层。
+
+### 4.4 浏览器缓存：UI transcript / 工作区展示态
+
+浏览器本地 IndexedDB / localStorage fallback 目前仍承担：
+
+- `project.messages`
+- 选中项目/版本指针
+- 某些 UI 工作区状态
+
+这意味着：
+
+- 换端口 / 换 origin 后，项目和文件还在，不代表聊天 transcript 还在。
+- 前端中间聊天面板当前不是完全服务端化的。
+
+相关代码：
+
+- `src/lib/workspace/storage.ts`
 
 ---
 
-## 第一版：受约束 DSL 游戏编辑器
+## 5. 当前实现边界：什么是“已实现”，什么只是历史/规划方向
 
-第一版的目标不是任意生成小游戏，而是：
+### 当前真实实现
 
-- 在一个狭窄玩法域里
-- 把自然语言稳定映射成结构化 DSL
-- 再把 DSL 映射成可玩的浏览器原型
+1. **当前 Upstash Box provider 连接的是预配置好的 Box**
+   - 使用：
+     - `UPSTASH_BOX_API_KEY`
+     - `UPSTASH_BOX_ID` 或 `UPSTASH_BOX_NAME`
+   - 当前代码不是“运行时动态给每个 session 新建一个 Box”
 
-### 第一版为什么需要 DSL
+2. **当前主执行模型是 async turn**
+   - `submit / status / result`
+   - `executeMessage()` 仅保留兼容语义，不应当再被当作主模型理解
 
-第一版最大的问题是：
+3. **当前真正可用的 runtime 是 Upstash Box + codex-app-server**
+   - `vercel-sandbox` 仍保留 provider seam，但不是当前主路径
 
-- 直接让 AI 输出“最终游戏代码”太不稳定
-- 很难验证
-- 很难修复
-- 很难版本化
+4. **当前项目文件和 AI session workspace 是分开的**
+   - project version → Blob
+   - workspace version → Box
 
-所以第一版在 AI 和运行时之间设计了一个中间映射层：
+### 不应当被写成“当前实现”的内容
 
-- `GameDsl`
+下面这些只适合作为历史背景或规划方向说明：
 
-相关定义：
-
-- `src/lib/game/dsl.ts`
-
-这个中间层把“游戏”约束成固定结构：
-
-- `meta`
-- `arena`
-- `player`
-- `enemies`
-- `spawners`
-- `collectibles`
-- `rules`
-- `ui`
-- `theme`
-
-它的价值在于：
-
-- AI 输出先变成结构化数据
-- 再由系统统一做校验、修复、预览
-- 不直接相信原始模型输出
-
-### 第一版如何解决“AI 发来的内容难以解析”
-
-第一版的关键经验就是：
-
-- 模型并不会老老实实输出你想要的严格 JSON
-
-它会出现的问题包括：
-
-- YAML / JSON 混用
-- 外层包了 `dsl` / `game` 字段
-- 字段名不统一
-- 数值和字符串类型混乱
-- 版本号写成 `1`、`1.0`、`v1`
-- collectibles / enemies / spawners 的结构别名五花八门
-
-第一版的解决方案主要落在：
-
-- `src/lib/game/validate.ts`
-- `src/lib/ai/generate-game.ts`
-
-#### 第一步：提取结构化候选
-
-在 `src/lib/ai/generate-game.ts` 里：
-
-- 先尝试结构化输出
-- 不行再从普通文本里提取 JSON / YAML 候选
-- 支持 code fence 与裸对象
-
-这一步解决的是：
-
-- “模型没有按最理想格式说话，但也许还能救回来”
-
-#### 第二步：做统一归一化
-
-在 `src/lib/game/validate.ts` 里：
-
-- `normalizeDslCandidate()`
-- `adaptToCanonicalDsl()`
-
-它会把各种近似结构映射成统一 DSL：
-
-- 版本号统一成 `1.0`
-- arena/player/enemy/spawner/collectible 的别名字段统一
-- 缺失字段补默认值
-- 不完整配置补成可玩的最小结构
-
-这一步就是第一版最重要的“中间映射层经验”。
-
-#### 第三步：做三层验证
-
-第一版不是只做 schema parse，而是做三层验证：
-
-1. schema validation
-2. rules validation
-3. smoke simulation
-
-对应代码：
-
-- `src/lib/game/validate.ts`
-- `src/lib/game/rules.ts`
-- `src/lib/game/smoke.ts`
-
-也就是：
-
-- 结构合法还不够
-- 还要看规则是否合法
-- 最后还要跑一个烟雾测试，看它能不能基本跑起来
-
-#### 第四步：repair 与 fallback
-
-在 `src/lib/ai/generate-game.ts` 中：
-
-- 如果生成结果验证不过，会尝试 repair
-- repair 再不过，就 fallback
-
-fallback 来源包括：
-
-- 模板 DSL
-- last known good
-
-对应代码：
-
-- `src/lib/game/templates.ts`
-
-这一步解决的是：
-
-- “即使模型不稳定，UI 也尽量别彻底坏掉”
-
-### 第一版的版本管理
-
-第一版虽然还是单项目，但已经有了后面第二版版本系统的雏形：
-
-- `live`
-- `staged`
-- `archive`
-- lineage
-- subtree delete
-
-核心代码：
-
-- `src/lib/state/session.ts`
-- `src/lib/state/versioning.ts`
-- `src/components/AppShell.tsx`
-
-当时做的事情包括：
-
-- 明确 modify 基线
-- 归档去重
-- 父子归档关系
-- 删除父节点时级联删除子节点
-
-这些能力后来直接变成了第二版 project/snapshot 体系的重要基础。
-
-### 第一版的局限
-
-第一版有很明显的边界：
-
-- 只支持 top-down 2D dodge-survival 一种玩法域
-- collectible 本质上还是 coin 语义
-- 运行时是单解释器，不是真正多玩法引擎
-- UI 更像单项目原型台，不像工作区
-- 只能在受约束 DSL 域里“稳定生成”，不能自由生成小游戏代码
-
-### 第一版给第二版打下了什么基础
-
-第一版最大的价值不只是“做出一个 dodge 编辑器”，而是积累了第二版最关键的工程经验：
-
-1. 云端模型接入经验
-   - provider 配置
-   - model 调用
-   - timeout
-   - repair
-   - fallback
-
-2. 解析不稳定 AI 输出的经验
-   - 提取 JSON/YAML
-   - 别名归一化
-   - 中间结构统一
-
-3. 运行前验证的经验
-   - schema
-   - rules
-   - smoke
-
-4. 版本管理经验
-   - baseline
-   - archive
-   - lineage
-   - subtree delete
-
-5. Workbench / 状态可解释性需求
-   - 用户不只需要“成功/失败”
-   - 还需要知道到底发生了什么
-
-正是因为第一版把这些基础问题趟过一遍，第二版才有能力从“受约束 DSL 编辑器”继续走到“多项目代码生成工作区”。
+1. 旧 README 里那套把 v1/v2 作为主要架构叙事的方式
+2. 把 architect / worker / fixer 五角色设计写成当前底层执行架构
+3. 把 `manifest.editable` 当作当前 modify 主 gating 逻辑
+4. 把 `threadId` 单独当成 continuity 真相
+5. 把浏览器 cache 当作正式持久化层
+6. 把“one box per active session”写成当前已经完全落地的事实
 
 ---
 
-## 当前仓库结构（按两代系统共存理解）
+## 6. Upstash Box + Codex Runtime：启动、认证、通信与回传链路
 
-```text
-src/
-  app/
-    api/
-      game/         # 第一版 DSL 路由
-      package/      # 第二版代码包路由
-      health/
-  components/
-    AppShell.tsx            # 第一版 UI
-    CodegenAppShell.tsx     # 第二版 UI 主入口
-    SandboxPreview.tsx      # 第二版沙箱预览
-    RequestWorkbench.tsx    # 第二版 Workbench
-  lib/
-    ai/
-    evaluator/
-    game/
-    package/
-    runtime/
-    state/
-    workspace/
-tests/
-  critical/       # 第一版关键测试
-  projects/       # 第二版项目/快照测试
-  sandbox/        # 第二版沙箱测试
+这是当前 README 必须单独成章的部分。
+
+### 6.1 当前 Box 连接模型
+
+当前 `UpstashBoxProvider` 的行为是：
+
+1. 读取 `UPSTASH_BOX_API_KEY`
+2. 读取 `UPSTASH_BOX_ID` 或 `UPSTASH_BOX_NAME`
+3. 调用：
+   - `Box.get(id, { apiKey })`
+   - 或 `Box.getByName(name, { apiKey })`
+
+也就是说：
+
+> **当前代码连接的是一个预配置好的 Box 实例。**
+
+相关代码：
+
+- `src/lib/sandbox/providers/upstash-box.ts`
+- `src/lib/config/infra.ts`
+
+### 6.2 Box 内如何准备 Codex runtime
+
+`UpstashBoxProvider.ensureCodexRuntime()` 会：
+
+1. 先执行：
+
+```sh
+uname -s && uname -m
 ```
 
+用于识别平台（如 `linux x86_64` / `linux aarch64`）
+
+2. 根据平台选择对应的 Codex GitHub release asset，例如：
+   - `codex-x86_64-unknown-linux-musl.tar.gz`
+   - `codex-aarch64-unknown-linux-musl.tar.gz`
+
+3. 先检查目标 binary 是否已存在、可执行，并通过 `--version` 校验
+
+4. 若不存在，则执行安装脚本：
+   - 创建 install dir
+   - `curl -fsSL` 下载 release
+   - `tar -xzf` 解压
+   - `chmod +x`
+   - `binary --version`
+
+默认安装目录：
+
+```text
+/workspace/home/.local/codex-runtime
+```
+
+相关配置：
+
+- `CODEX_RUNTIME_INSTALL_DIR`
+- `CODEX_RUNTIME_RELEASE_TAG`
+- `CODEX_RUNTIME_BINARY_NAME`
+
+相关代码：
+
+- `src/lib/sandbox/providers/upstash-box.ts`
+- `src/lib/config/infra.ts`
+
+### 6.3 AI session bootstrap：Box workspace 怎么准备
+
+AI session bootstrap 总入口在：
+
+- `src/lib/ai-sessions/service.ts`
+  - `bootstrapSession(sessionId, bindToken)`
+
+它会做：
+
+1. 把 session 状态切到：
+   - `hydrating`
+   - `boxStatus=provisioning`
+   - `appServerStatus=starting`
+   - `daemonStatus=starting`
+
+2. 通过 host token service 完成 AI session 与 host auth session 的绑定 bootstrap
+
+3. 从 project 的 `baseVersion` 读取 canonical 文件
+
+4. 把这些文件写到 Box 中：
+
+```text
+sessions/{sessionId}/v1/index.html
+sessions/{sessionId}/v1/game.js
+sessions/{sessionId}/v1/style.css
+sessions/{sessionId}/v1/manifest.json
+```
+
+5. 再写入 workspace contract 文件
+
+6. 最后把 session 标记回：
+   - `status=ready`
+   - `boxStatus=ready`
+   - `appServerStatus=stopped`
+   - `daemonStatus=stopped`
+
+也就是说：
+
+> **bootstrapSession() 做的是工作区 hydration，不是直接把 app-server 起起来。**
+
+### 6.4 OAuth / host token handoff：登录信息怎么进 Codex
+
+这一层由 host token service 负责。
+
+核心文件：
+
+- `src/lib/host-tokens/server/service.ts`
+- `src/app/api/codex/host/session/*`
+- `src/app/api/ai/sessions/[id]/bootstrap/route.ts`
+- `src/app/api/ai/sessions/[id]/init/route.ts`
+
+流程分成几步：
+
+#### 第一步：浏览器完成 OAuth
+
+host token service 会：
+
+1. 生成 OAuth authorize URL
+2. 生成 `state / verifier / challenge`
+3. 处理 callback
+4. 存储 host auth session
+5. 生成一个 `bindToken`
+
+#### 第二步：AI session 用 bindToken 绑定 host auth session
+
+前端在调用：
+
+- `/api/ai/sessions/{id}/bootstrap`
+- 或 `/api/ai/sessions/{id}/init`
+
+时，会把 `bindToken` 传进去。
+
+`bootstrapSession()` 再调用：
+
+- `HostTokenServiceClient.bootstrap({ sessionId, bindToken })`
+
+拿回：
+
+- `idToken`
+- `accessToken`
+- `expiresAt`
+- `accountId`
+
+#### 第三步：初始化 app-server 时，把 token 作为初始化消息送进去
+
+`initializeTransport()` 里会先 refresh 一次 host token，再构造初始化消息：
+
+- `createInitializeMessages()`
+- `createExternalAuthLoginMessage(hostTokens)`
+- `createThreadStartMessage(...)`
+
+这意味着：
+
+> **当前实现不是把 refresh token 永久写进 Box，而是把短期 token 作为初始化消息传给 app-server。**
+
+#### 第四步：token 过期后，daemon 代表 app-server 回调 host token service 刷新
+
+daemon 内部有：
+
+- `refreshExternalTokens()`
+
+当 app-server 发出：
+
+- `account/chatgptAuthTokens/refresh`
+
+daemon 会请求：
+
+- `/api/codex/host/session/refresh`
+
+并在请求头里带：
+
+- `Authorization: Bearer ${hostTokenService.apiKey}`
+
+所以刷新语义是：
+
+> **Box 内不会自己做 OAuth；宿主负责刷新，再把新的 accessToken 回送给 app-server。**
+
+### 6.5 daemon/app-server 是怎么启动的
+
+transport 初始化总入口是：
+
+- `initializeTransport(sessionId, bindToken)`
+
+关键步骤：
+
+1. 先确保 session 已 bootstrap
+2. 调 `sandboxProvider.ensureCodexRuntime()`
+3. 计算默认 app-server config
+4. 构造 host token runtime config
+5. 调 `ensureCodexAppServerDaemon(...)`
+6. 再通过 daemon 发起 init request，直到 `thread/started`
+
+其中 daemon 启动流程在：
+
+- `src/lib/ai-sessions/app-server-daemon.ts`
+  - `ensureCodexAppServerDaemon(...)`
+
+它会：
+
+1. 把 `.codex-daemon.mjs` 写进 Box
+2. 把 `.codex-daemon-config.json` 写进 Box
+3. 用：
+
+```sh
+nohup node .codex-daemon.mjs ./.codex-daemon-config.json > ./.codex-daemon.out 2>&1 &
+```
+
+起 daemon
+
+4. 轮询本地：
+
+```text
+GET /health
+```
+
+直到 daemon 报 `ok: true`
+
+daemon 起起来后，daemon 再用 `spawn(config.command, config.args, { cwd, stdio })` 启动真正的 Codex app-server。
+
+### 6.6 当前协议是怎么设计的
+
+这一层现在是两层协议叠加：
+
+#### a) app-server ↔ daemon：JSON-RPC 风格的行消息协议
+
+daemon 用 readline 一行一行读 child stdout，并按这些字段处理：
+
+- `id`
+- `method`
+- `result`
+- `error`
+
+所以它本质上是：
+
+> **JSON-RPC 风格的 line-delimited message protocol**
+
+#### b) service ↔ daemon：Box 内 localhost HTTP API
+
+daemon 暴露：
+
+- `GET /health`
+- `POST /shutdown`
+- `POST /execute`
+- `POST /turns/submit`
+- `GET /turns/:id/status`
+- `GET /turns/:id/result`
+- `GET /turns/:id/messages`
+
+service 不直接碰 app-server stdout，而是：
+
+1. 先把 request 写成 `.codex-daemon-request.json`
+2. 再通过 curl 调 localhost daemon API
+
+### 6.7 submit / status / result 是怎么回传到前端的
+
+当前主模型是：
+
+#### 第一步：前端发 create / modify / debug
+
+package route 在 `aiSessionId` 存在时，返回：
+
+- `202`
+- `accepted: true`
+- `asyncTurn`
+
+#### 第二步：service 提交 daemon turn
+
+`submitMessageTurn()` 最终会走到：
+
+- `submitCodexAppServerDaemonTurn(...)`
+
+daemon 会把 turn 记录持久化为：
+
+- `.codex-turns/{turnId}.json`
+- `.codex-turns/{turnId}.messages.jsonl`
+
+#### 第三步：前端轮询 status
+
+`CodegenAppShell` 会：
+
+1. 持有 `turnId`
+2. 用 backoff 轮询 `/messages/[turnId]`
+3. 命中 terminal 后再拉 `/messages/[turnId]/result`
+
+#### 第四步：service finalize
+
+service 在 finalize 时会：
+
+1. 读 Box workspace package
+2. parse / recover / evaluate
+3. 写 turn resultPayload
+4. promote workspace version
+5. 更新 session/event/transport 状态
+
+#### 第五步：前端 merge result
+
+`finalizeAsyncTurn()` 最终把：
+
+- `currentPackage`
+- `currentEvaluator`
+- `lastExecutionTrace`
+
+合并回当前工作区 UI。
+
 ---
 
-## 运行方式
+## 7. 版本语义：必须分清的两套版本号
 
-### 基本运行
+### 7.1 Workspace Version
+
+对应：
+
+- `ai_sessions.activeWorkspaceVersion`
+- `ai_sessions.latestWorkspaceVersion`
+- `session:vN`
+- Box 中的 `sessions/{sessionId}/vN`
+
+它表示：
+
+> **AI session 当前工作头已经演进到第几版。**
+
+### 7.2 Project Version
+
+对应：
+
+- `projects.currentVersion`
+- `project_versions.version`
+- Blob 中的 `/projects/{projectId}/vN/*`
+
+它表示：
+
+> **正式归档项目已经到第几版。**
+
+### 7.3 为什么会出现“前端像 v3，Blob 却只有 v2”
+
+因为：
+
+- 前端可能正在看 workspace v3
+- 但正式 project version 之前只归档到了 v1
+- 所以下一次 Archive / Checkpoint 只会生成 project v2
+
+这不是 Blob 算错了，而是：
+
+> **workspaceVersion 与 project version 天生不是一个计数器。**
+
+---
+
+## 8. Archive 与 Checkpoint 的区别
+
+### 8.1 Archive Snapshot
+
+Archive 的语义更接近：
+
+> **把当前包手动存成一个新的 project version**
+
+它会写 Blob / project_versions，但不会推进 aiSession 基线语义。
+
+### 8.2 Checkpoint AI Session
+
+Checkpoint 的语义是：
+
+> **把当前 AI session 工作头正式提交成新的 durable project head，并推进 session 基线**
+
+它会：
+
+1. 校验 `project.currentVersion === session.baseVersion`
+2. 从 active workspace read back package
+3. `saveGeneratedPackage(...)`
+4. 生成 checkpoint 记录
+5. 更新 `session.baseVersion`
+6. 记 `lastCheckpointVersion`
+
+所以：
+
+> **Checkpoint 是 session 级提交；Archive 是 project 级归档。**
+
+---
+
+## 9. 端到端工作流（当前实现）
+
+### 9.1 Create
+
+1. 选择 project
+2. 建立/复用 AI session
+3. 如果 transport 未 ready，则 bootstrap + initializeTransport
+4. create turn 默认使用当前 active workspace 作为基线
+5. 结果先进入 Box workspace head
+6. 是否进入正式 project version，要看是否 Checkpoint / Archive / 同步持久化路径
+
+### 9.2 Modify
+
+1. 选择 modify base
+   - 可以是当前 head
+   - 也可以是历史 `session:vN`
+   - 也可以是 project snapshot
+2. modify 不是原地改旧版本，而是 fork 出新 workspace head
+3. Codex 在新 head 上执行
+
+### 9.3 Debug
+
+1. 选定 debug target
+2. 以错误描述 + 当前包为输入
+3. 生成修复后的新 workspace head
+
+### 9.4 Browse 历史 Box Version
+
+当前前端已经允许：
+
+- 浏览历史 `session:vN`
+- 再基于它继续 modify
+
+这不是 restore；它的真实语义是：
+
+> **以该历史 Box version 为 base，再 fork 一个新的 head 继续改。**
+
+### 9.5 Checkpoint
+
+1. 从当前 active workspace 读 package
+2. 检查 baseVersion 是否 stale
+3. 如果一致，生成新的 project version
+4. 更新 session.baseVersion
+
+### 9.6 Restore
+
+当前需要分两层理解 Restore：
+
+1. **后端能力层**
+   - `ProjectService.restoreVersion()` 确实提供了 durable project-version restore 能力
+   - 它会生成一个新的正式 project version
+
+2. **当前前端主流交互层**
+   - `CodegenAppShell` 里的 server-backed Restore 目前更接近“切换预览/修改基线”
+   - 它会把 `currentPackage/currentEvaluator` 切到所选 snapshot，并把 modify/debug baseline 指向这个版本
+   - 它不会在当前这条 UI 交互里直接完成 durable restore 提交
+
+所以当前更准确的说法是：
+
+> **后端已有 project-version restore 能力，但前端 server-backed Restore 的主流语义目前仍然是预览与基线切换，而不是直接提交 durable restore。**
+
+---
+
+## 10. 启动与开发方式
+
+### 10.1 基本启动
 
 ```bash
 npm install
 npm run dev
 ```
 
-打开：
+默认地址：
 
-- `http://localhost:3000`
-
-### 环境变量
-
-建议复制：
-
-- `.env.example` -> `.env.local` 或 `.env`
-
-最小可用配置（apiyi）：
-
-```env
-APIYI_LLM_API_KEY=你的key
-MODEL_CALL_TIMEOUT_MS=120000
+```text
+http://localhost:3000
 ```
 
-可选显式写法：
+改端口：
 
-```env
-LLM_PROVIDER=apiyi
-APIYI_LLM_API_KEY=你的key
-MODEL_CALL_TIMEOUT_MS=120000
+```powershell
+$env:PORT=3001; npm run dev
 ```
 
-注意：
+### 10.2 当前关键环境变量
 
-- 如果没有 API key，界面仍可运行，但会更多依赖 fallback package
-- OpenRouter 路径存在，但当前主验证路径仍以 apiyi 为主
+#### 数据库
+
+- `DATABASE_URL`
+
+#### 对象存储
+
+- `BLOB_READ_WRITE_TOKEN`（启用 Blob）
+- `STORAGE_PROVIDER=blob|local`（可显式指定）
+- `LOCAL_STORAGE_PATH`（若使用本地文件存储 provider）
+
+#### Upstash Box
+
+- `UPSTASH_BOX_API_KEY`
+- `UPSTASH_BOX_ID` 或 `UPSTASH_BOX_NAME`
+- `SANDBOX_PROVIDER=upstash-box|vercel-sandbox`
+
+#### Codex runtime / app-server
+
+- `CODEX_APP_SERVER_COMMAND`
+- `CODEX_APP_SERVER_ARGS`
+- `CODEX_APP_SERVER_PORT`
+- `CODEX_RUNTIME_INSTALL_DIR`
+- `CODEX_RUNTIME_RELEASE_TAG`
+- `CODEX_RUNTIME_BINARY_NAME`
+- `CODEX_ROUTE_ENGINE`
+
+#### Host token service
+
+- `HOST_TOKEN_SERVICE_URL`
+- `HOST_TOKEN_SERVICE_API_KEY`
+
+#### OpenAI OAuth / host auth
+
+- `OPENAI_OAUTH_ISSUER`
+- `OPENAI_OAUTH_CLIENT_ID`
+- `OPENAI_OAUTH_CALLBACK_PORT`
+- `OPENAI_OAUTH_CALLBACK_PATH`
+- `OPENAI_OAUTH_REDIRECT_URI`
+- `OPENAI_OAUTH_SCOPES`
+- `OPENAI_OAUTH_ORIGINATOR`
+
+### 10.3 运行前的最小理解
+
+如果你想走**当前主链路**（Upstash Box + codex-app-server），至少要满足：
+
+1. `DATABASE_URL`
+2. `UPSTASH_BOX_API_KEY + UPSTASH_BOX_ID/NAME`
+3. `HOST_TOKEN_SERVICE_URL + HOST_TOKEN_SERVICE_API_KEY`
+4. `OPENAI_OAUTH_*`
+
+Blob 不是必须，但如果不启 Blob，project version 会走本地 provider / 本地调试语义，而不是线上对象存储语义。
 
 ---
 
-## 验证命令
+## 11. 验证命令
 
 ```bash
 npm run lint
-npm run test:critical
 npm run test:projects
-npm run test:sandbox
 npm run build
 ```
 
+如果要重点验证 async-turn / ai-session / Upstash 相关逻辑，优先看：
+
+- `tests/projects/app-server-daemon.test.ts`
+- `tests/projects/ai-session-service.test.ts`
+- `tests/projects/ai-session-service-transport-hardening.test.ts`
+- `tests/api/ai-sessions-api.test.ts`
+- `tests/api/package-routes.test.ts`
+- `tests/sandbox/upstash-box-provider.test.ts`
+
 ---
 
-## 当前版本一句话总结
+## 12. 最容易踩坑的地方
 
-如果只用一句话描述当前仓库，我会这样说：
+### 12.1 `workspaceVersion` 不等于 Blob 里的 `vN`
 
-> 这是一个从“受约束 DSL 游戏编辑器”演进到“多项目 AI 小游戏代码生成工作区”的实验性全栈项目，重点不在做通用引擎，而在自然语言生成、可运行性验证、修复兜底、版本管理与可解释性。
+这是最常见误解。
+
+### 12.2 AI session 成功不等于 project version 已归档成功
+
+工作区成功只是 Box head 成功，不代表 Blob 已经出现新版本。
+
+### 12.3 Archive 不等于 Checkpoint
+
+Archive 是项目级归档；Checkpoint 是 session 级提交。
+
+### 12.4 浏览器聊天 transcript 不是当前最权威的持久化事实
+
+它更多是浏览器缓存优先的 UI 展示层状态。
+
+### 12.5 当前实现不是“每个 session 动态创建一个全新 Box”
+
+当前代码是连接预配置 Box，再按 session 分工作区根目录。
+
+### 12.6 不要再把 `executeMessage()` 当主路径来理解系统
+
+现在主模型是 `submit / status / result` async turn。
+
+### 12.7 浏览历史 Box version 不等于“只能看，不能继续改”
+
+当前正确语义是：
+
+> 可以从历史 Box version fork 新 head 继续 modify。
+
+---
+
+## 13. 开发工作流建议（给接手人）
+
+建议把问题拆成三层看：
+
+1. **Project 层**
+   - `currentVersion` 是否正确
+   - Blob 中是否已有 `projects/{projectId}/vN/*`
+
+2. **AI Session 层**
+   - `activeWorkspaceVersion / latestWorkspaceVersion`
+   - `appServerStatus / daemonStatus / authState`
+   - 是否已经 checkpoint
+
+3. **Turn 层**
+   - `requestText`
+   - `status / artifactState / finalOutcome`
+   - `agentText`
+   - `resultPayload / diagnostics`
+
+排查顺序建议：
+
+1. 先看 project / version
+2. 再看 ai session
+3. 最后看具体 turn 与 daemon 状态
+
+不要一上来只盯前端界面现象。
+
+---
+
+## 14. 历史背景：哪些内容应该作为背景而不是当前实现
+
+下面这些内容仍然有历史价值，但不应该再被当成“当前系统就是这样”的描述：
+
+1. 旧 README 中以 v1 / v2 产品叙事为主的解释方式
+2. 以 architect / worker / fixer 等角色分工作为底层执行真相
+3. 把 `manifest.editable` 视为当前 modify 路由的主要 gating 逻辑
+4. 把浏览器本地 archive/snapshot 当作主持久化模型
+5. 把 threadId 单独当作 continuity 真相
+6. 把 `vercel-sandbox` 写成当前主 runtime
+
+历史脉络请看：
+
+- `history/26_4_14/`
+- `history/26_4_15/`
+- `history/26_4_16/`
+- `history/27_4_17/`
+- `history/27_4_17_new/`
+
+这些文档应该被用于：
+
+- 理解为什么架构会演进成今天这样
+- 理解哪些怀疑后来被推翻
+- 理解踩坑与收敛过程
+
+而不是直接替代当前代码的真实解释。
+
+---
+
+## 15. 关键代码地图
+
+### 前端工作区与 Workbench
+
+- `src/components/CodegenAppShell.tsx`
+- `src/components/RequestWorkbench.tsx`
+- `src/components/SandboxPreview.tsx`
+
+### Project / Blob / 正式版本
+
+- `src/lib/projects/service.ts`
+- `src/lib/projects/repository.ts`
+- `src/lib/storage/index.ts`
+- `src/lib/storage/providers/vercel-blob.ts`
+
+### AI session / turn / checkpoint / finalize
+
+- `src/lib/ai-sessions/service.ts`
+- `src/lib/ai-sessions/repository.ts`
+- `src/lib/ai-sessions/types.ts`
+- `src/lib/ai-sessions/workspace.ts`
+- `src/lib/ai-sessions/transport-runtime.ts`
+- `src/lib/ai-sessions/supervisor.ts`
+
+### Upstash Box / Codex runtime / daemon
+
+- `src/lib/sandbox/providers/upstash-box.ts`
+- `src/lib/sandbox/index.ts`
+- `src/lib/ai-sessions/app-server-daemon.ts`
+- `src/lib/ai-sessions/app-server-stdio.ts`
+- `src/lib/config/infra.ts`
+
+### Host token service / OAuth
+
+- `src/lib/host-tokens/server/service.ts`
+- `src/lib/host-tokens/server/config.ts`
+- `src/lib/host-tokens/server/neon-store.ts`
+- `src/app/api/codex/host/session/*`
+- `src/app/api/ai/sessions/[id]/bootstrap/route.ts`
+- `src/app/api/ai/sessions/[id]/init/route.ts`
+
+### 数据库 schema
+
+- `src/lib/db/schema-pg.ts`
+- `src/lib/db/index.ts`
+
+---
+
+## 16. 一句话总结当前系统
+
+如果只用一句话描述当前 `game_edit`：
+
+> 这是一个把正式项目版本、AI session 工作区、Upstash Box 中的 Codex runtime、host OAuth/token bridge、以及前端工作台拼接在一起的 AI 原生小游戏编辑系统；它的重点不是“单次生成”，而是**多轮修改、可追踪执行、可 checkpoint、可版本化归档**。
