@@ -6,7 +6,7 @@
 
 1. 这个项目**现在真实跑的是什么架构**。
 2. 数据分别落在哪一层（Neon / Blob / Box / 浏览器缓存）。
-3. create / modify / debug / checkpoint / archive 这些动作到底各自意味着什么。
+3. create / modify / checkpoint / archive 这些动作到底各自意味着什么，以及哪些旧入口只是残留。
 4. Upstash Box + Codex runtime 是如何被接起来、认证、通信、回传结果的。
 5. 哪些历史说法已经不再适合作为“当前实现”的解释。
 
@@ -32,7 +32,7 @@
 
 1. **前端工作区层**
    - 项目列表
-   - 聊天与模式切换（create / modify / debug）
+   - 聊天与模式切换（当前主工作流以 create / modify 为主；debug 仍有 UI 残留但不作为当前主口径）
    - Workbench / 执行状态 / 预览
 
 2. **项目与正式版本层**
@@ -166,9 +166,11 @@ sessions/{sessionId}/v3
 
 ### 3.5 Turn
 
-Turn 是一次 create / modify / debug 请求的执行记录，对应：
+Turn 是一次 AI session 请求的执行记录，对应：
 
 - `ai_session_turns`
+
+当前主线上主要对应 create / modify；debug 相关字段与路径仍有残留，但不应再作为 README 的主工作流来理解。
 
 它保存：
 
@@ -298,6 +300,9 @@ Box 负责存：
    - project version → Blob
    - workspace version → Box
 
+5. **当前 README 的主工作流应按 create / modify 理解**
+   - debug 相关 UI / route 仍有残留，但不是现在实际采用的主流程
+
 ### 不应当被写成“当前实现”的内容
 
 下面这些只适合作为历史背景或规划方向说明：
@@ -317,17 +322,17 @@ Box 负责存：
 
 ### 6.1 当前 Box 连接模型
 
-当前 `UpstashBoxProvider` 的行为是：
+当前实现需要先具备一个可访问的 Upstash Box 实例，再由 `UpstashBoxProvider` 基于配置去连接这个预配置 Box。
 
-1. 读取 `UPSTASH_BOX_API_KEY`
-2. 读取 `UPSTASH_BOX_ID` 或 `UPSTASH_BOX_NAME`
-3. 调用：
-   - `Box.get(id, { apiKey })`
-   - 或 `Box.getByName(name, { apiKey })`
+从交接口径上，应该把这件事理解成：
+
+1. `UPSTASH_BOX_API_KEY` / `UPSTASH_BOX_ID` / `UPSTASH_BOX_NAME` 负责的是 **Box 访问与定位**。
+2. 它们不应该被描述成“AI/Codex 登录方式”。
+3. 当前项目真正用于让 Codex 工作的是 **Codex OAuth + host token service + bindToken** 这一套认证链，而不是 Upstash 内置的 AI 会员登录体系。
 
 也就是说：
 
-> **当前代码连接的是一个预配置好的 Box 实例。**
+> **当前代码连接的是一个预配置好的 Box 实例；真正的 AI 认证语义来自 Codex OAuth，而不是 Upstash 内置 AI 登录。**
 
 相关代码：
 
@@ -573,7 +578,7 @@ service 不直接碰 app-server stdout，而是：
 
 当前主模型是：
 
-#### 第一步：前端发 create / modify / debug
+#### 第一步：前端发 create / modify
 
 package route 在 `aiSessionId` 存在时，返回：
 
@@ -714,11 +719,15 @@ Checkpoint 的语义是：
 2. modify 不是原地改旧版本，而是 fork 出新 workspace head
 3. Codex 在新 head 上执行
 
-### 9.3 Debug
+### 9.3 Debug（残留路径）
 
-1. 选定 debug target
-2. 以错误描述 + 当前包为输入
-3. 生成修复后的新 workspace head
+当前代码中仍然保留了 debug 相关 UI / route / turn 字段，但它不应当再被写成当前主工作流。
+
+对交接方更准确的理解是：
+
+1. 当前实际采用的主流程是 create / modify。
+2. debug 仍有残留实现，可作为兼容或后续清理对象看待。
+3. README 不应再把它和 create / modify 并列写成当前主产品路径。
 
 ### 9.4 Browse 历史 Box Version
 
@@ -748,7 +757,7 @@ Checkpoint 的语义是：
 
 2. **当前前端主流交互层**
    - `CodegenAppShell` 里的 server-backed Restore 目前更接近“切换预览/修改基线”
-   - 它会把 `currentPackage/currentEvaluator` 切到所选 snapshot，并把 modify/debug baseline 指向这个版本
+   - 它会把 `currentPackage/currentEvaluator` 切到所选 snapshot，并把 modify baseline 指向这个版本
    - 它不会在当前这条 UI 交互里直接完成 durable restore 提交
 
 所以当前更准确的说法是：
